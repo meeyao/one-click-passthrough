@@ -325,14 +325,22 @@ required_space_gb() {
 check_disk_space() {
   local target="$1"
   local disk_size_gb="$2"
+  local existing_disk_path="${3:-}"
   local required available
-  required="$(required_space_gb "${disk_size_gb}" "10")"
+  if [[ -n "${existing_disk_path}" && -f "${existing_disk_path}" ]]; then
+    required="10"
+  else
+    required="$(required_space_gb "${disk_size_gb}" "10")"
+  fi
   available="$(available_space_gb "${target}" || true)"
   [[ -n "${available}" ]] || {
     warn "Could not determine free disk space for ${target}"
     return 0
   }
   if (( available < required )); then
+    if [[ -n "${existing_disk_path}" && -f "${existing_disk_path}" ]]; then
+      fail "Insufficient free space at ${target}: ${available}G available, ${required}G required (~10G install media overhead while reusing existing VM disk ${existing_disk_path})."
+    fi
     fail "Insufficient free space at ${target}: ${available}G available, ${required}G required (${disk_size_gb}G VM disk + ~10G install media overhead)."
   fi
 }
@@ -485,32 +493,61 @@ windows_language_culture() {
 
 prompt_windows_version() {
   local default="${1:-win11x64}"
-  local answer normalized
-  while :; do
-    answer="$(prompt "Windows version (examples: 11, 11e, 11ltsc, 10, 10e, 2022)" "${default}")"
-    normalized="$(normalize_windows_version "${answer}")"
-    [[ -n "${normalized}" ]] || {
-      warn "Invalid Windows version."
-      continue
-    }
-    printf '%s\n' "${normalized}"
-    return 0
-  done
+  local options=(
+    "Windows 11 Pro/Enterprise [win11x64]"
+    "Windows 11 Enterprise Eval [win11x64-enterprise-eval]"
+    "Windows 11 LTSC [win11x64-ltsc]"
+    "Windows 10 Pro/Enterprise [win10x64]"
+    "Windows 10 Enterprise Eval [win10x64-enterprise-eval]"
+    "Windows Server 2022 Eval [win2022eval]"
+  )
+  local default_index="1"
+
+  case "${default}" in
+    win11x64-enterprise-eval) default_index="2" ;;
+    win11x64-ltsc) default_index="3" ;;
+    win10x64) default_index="4" ;;
+    win10x64-enterprise-eval) default_index="5" ;;
+    win2022eval) default_index="6" ;;
+  esac
+
+  case "$(prompt_menu_choice "Windows version" "${default_index}" "${options[@]}")" in
+    *"[win11x64]") printf 'win11x64\n' ;;
+    *"[win11x64-enterprise-eval]") printf 'win11x64-enterprise-eval\n' ;;
+    *"[win11x64-ltsc]") printf 'win11x64-ltsc\n' ;;
+    *"[win10x64]") printf 'win10x64\n' ;;
+    *"[win10x64-enterprise-eval]") printf 'win10x64-enterprise-eval\n' ;;
+    *"[win2022eval]") printf 'win2022eval\n' ;;
+    *) fail "Unexpected Windows version selection." ;;
+  esac
 }
 
 prompt_windows_language() {
   local default="${1:-en}"
-  local answer normalized
-  while :; do
-    answer="$(prompt "Windows language (examples: en, en-gb, de, fr, ja)" "${default}")"
-    normalized="$(normalize_windows_language "${answer}")"
-    [[ -n "${normalized}" ]] || {
-      warn "Invalid Windows language."
-      continue
-    }
-    printf '%s\n' "${normalized}"
-    return 0
-  done
+  local options=(
+    "English (US) [en]"
+    "English (UK) [en-gb]"
+    "German [de]"
+    "French [fr]"
+    "Japanese [ja]"
+  )
+  local default_index="1"
+
+  case "${default}" in
+    en-gb) default_index="2" ;;
+    de) default_index="3" ;;
+    fr) default_index="4" ;;
+    ja) default_index="5" ;;
+  esac
+
+  case "$(prompt_menu_choice "Windows language" "${default_index}" "${options[@]}")" in
+    *"[en]") printf 'en\n' ;;
+    *"[en-gb]") printf 'en-gb\n' ;;
+    *"[de]") printf 'de\n' ;;
+    *"[fr]") printf 'fr\n' ;;
+    *"[ja]") printf 'ja\n' ;;
+    *) fail "Unexpected Windows language selection." ;;
+  esac
 }
 
 discover_ovmf_code() {
@@ -616,6 +653,61 @@ prompt() {
   fi
 }
 
+prompt_menu_choice() {
+  local message="$1"
+  local default_index="$2"
+  shift 2
+  local options=("$@")
+  local answer selected index
+
+  while :; do
+    index=1
+    for selected in "${options[@]}"; do
+      printf '  %b%2d)%b %s\n' "${C_BLUE}" "${index}" "${C_RESET}" "${selected}" >&2
+      index=$((index + 1))
+    done
+    answer="$(prompt "${message}" "${default_index}")"
+    if [[ "${answer}" =~ ^[1-9][0-9]*$ ]]; then
+      selected="${options[$((answer - 1))]:-}"
+      if [[ -n "${selected}" ]]; then
+        printf '%s\n' "${selected}"
+        return 0
+      fi
+    fi
+    warn "Choose one of the listed options."
+  done
+}
+
+prompt_secret() {
+  local message="$1"
+  local default="${2:-}"
+  local answer
+  while :; do
+    if [[ -n "${default}" ]]; then
+      read -r -s -p "$(printf '%b›%b %s %b[hidden, press Enter to keep current]%b: ' "${C_GREEN}" "${C_RESET}" "${message}" "${C_DIM}" "${C_RESET}")" answer
+      printf '\n' >&2
+      printf '%s\n' "${answer:-$default}"
+      return 0
+    fi
+    read -r -s -p "$(printf '%b›%b %s: ' "${C_GREEN}" "${C_RESET}" "${message}")" answer
+    printf '\n' >&2
+    [[ -n "${answer}" ]] || {
+      warn "${message} cannot be blank."
+      continue
+    }
+    printf '%s\n' "${answer}"
+    return 0
+  done
+}
+
+xml_escape() {
+  local value="${1:-}"
+  value="${value//&/&amp;}"
+  value="${value//</&lt;}"
+  value="${value//>/&gt;}"
+  printf '%s\n' "${value}"
+}
+
 confirm() {
   local message="$1"
   local default="${2:-y}"
@@ -636,24 +728,24 @@ prompt_windows_iso_strategy() {
     if [[ -n "${detected}" && -f "${detected}" ]]; then
       ui_note "Detected local Windows ISO: ${detected}" >&2
       ui_note "Choose how you want to continue:" >&2
-      printf '  %b1)%b Use detected ISO\n' "${C_BLUE}" "${C_RESET}" >&2
-      printf '  %b2)%b Enter a different ISO path\n' "${C_BLUE}" "${C_RESET}" >&2
-      printf '  %b3)%b Download Windows ISO automatically\n' "${C_BLUE}" "${C_RESET}" >&2
-      answer="$(prompt "Windows ISO option" "1")"
+      answer="$(prompt_menu_choice "Windows ISO option" "1" \
+        "Use detected ISO" \
+        "Enter a different ISO path" \
+        "Download Windows ISO automatically")"
       case "${answer}" in
-        1|use|detected) printf 'detected\n'; return 0 ;;
-        2|path|manual) printf 'manual\n'; return 0 ;;
-        3|download|auto) printf 'download\n'; return 0 ;;
+        "Use detected ISO") printf 'detected\n'; return 0 ;;
+        "Enter a different ISO path") printf 'manual\n'; return 0 ;;
+        "Download Windows ISO automatically") printf 'download\n'; return 0 ;;
       esac
     else
       ui_note "No local Windows ISO was detected." >&2
       ui_note "Choose how you want to continue:" >&2
-      printf '  %b1)%b Enter a Windows ISO path\n' "${C_BLUE}" "${C_RESET}" >&2
-      printf '  %b2)%b Download Windows ISO automatically\n' "${C_BLUE}" "${C_RESET}" >&2
-      answer="$(prompt "Windows ISO option" "2")"
+      answer="$(prompt_menu_choice "Windows ISO option" "1" \
+        "Enter a Windows ISO path" \
+        "Download Windows ISO automatically")"
       case "${answer}" in
-        1|path|manual) printf 'manual\n'; return 0 ;;
-        2|download|auto) printf 'download\n'; return 0 ;;
+        "Enter a Windows ISO path") printf 'manual\n'; return 0 ;;
+        "Download Windows ISO automatically") printf 'download\n'; return 0 ;;
       esac
     fi
     warn "Choose one of the listed Windows ISO options."
@@ -1142,7 +1234,7 @@ select_gpu() {
   local choice selected
   render_device_menu "${entries}"
   while :; do
-    choice="$(prompt "Select the GPU number to passthrough")"
+    choice="$(prompt "Select the GPU number to passthrough" "1")"
     [[ "${choice}" =~ ^[1-9][0-9]*$ ]] || {
       warn "Invalid GPU selection."
       continue
@@ -1224,6 +1316,35 @@ list_usb_controllers() {
     }'
 }
 
+iommu_group_devices() {
+  local pci="$1"
+  local group_path
+  group_path="$(readlink -f "/sys/bus/pci/devices/${pci}/iommu_group" 2>/dev/null || true)"
+  [[ -n "${group_path}" && -d "${group_path}/devices" ]] || return 1
+  find -L "${group_path}/devices" -maxdepth 1 -mindepth 1 -printf '%f\n' | sort
+}
+
+pci_group_isolated() {
+  local pci="$1"
+  local count
+  count="$(iommu_group_devices "${pci}" 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [[ "${count}" == "1" ]]
+}
+
+isolated_usb_controllers() {
+  local entries="$1"
+  local slot desc any
+  any=0
+  while IFS='|' read -r slot desc; do
+    [[ -n "${slot}" ]] || continue
+    if pci_group_isolated "${slot}"; then
+      printf '%s|%s\n' "${slot}" "${desc}"
+      any=1
+    fi
+  done <<< "${entries}"
+  return 0
+}
+
 recommended_usb_controller() {
   local entries="$1"
   local line
@@ -1285,13 +1406,22 @@ classify_usb_entry() {
 prompt_usb_mode() {
   local default="$1"
   local answer
-  while :; do
-    answer="$(prompt "USB passthrough mode (none/controller/devices)" "${default}")"
-    case "${answer}" in
-      none|controller|devices) printf '%s\n' "${answer}"; return 0 ;;
-      *) warn "Enter one of: none, controller, devices." ;;
-    esac
-  done
+  local default_index="1"
+  case "${default}" in
+    controller) default_index="2" ;;
+    devices|device) default_index="3" ;;
+  esac
+
+  answer="$(prompt_menu_choice "USB passthrough mode" "${default_index}" \
+    "No USB passthrough [none]" \
+    "Pass through one whole USB controller [controller]" \
+    "Pass through selected USB devices [devices]")"
+  case "${answer}" in
+    *"[none]") printf 'none\n' ;;
+    *"[controller]") printf 'controller\n' ;;
+    *"[devices]") printf 'devices\n' ;;
+    *) fail "Unexpected USB mode selection." ;;
+  esac
 }
 
 select_usb_controller() {
@@ -1324,7 +1454,7 @@ select_usb_devices() {
   local entries="$1"
   local selection action selected_lines="" item entry class
   render_plain_menu "${entries}"
-  ui_note "Pick one or more USB devices. Commands: number, comma list, list, clear, done."
+  ui_note "Pick one or more USB devices. Commands: number, comma list, list, clear, done." >&2
   while :; do
     if [[ -n "${selected_lines}" ]]; then
       printf '%bCurrently selected:%b\n' "${C_BOLD}" "${C_RESET}" >&2
@@ -1392,6 +1522,16 @@ normalize_cmdline() {
   printf '%s\n' "$*" | awk '{$1=$1; print}'
 }
 
+extract_grub_cmdline_default() {
+  local file="$1"
+  local current
+  current="$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "${file}" | head -n1 | cut -d'"' -f2)"
+  current="${current#GRUB_CMDLINE_LINUX_DEFAULT=}"
+  current="${current#\'}"
+  current="${current%\'}"
+  normalize_cmdline "${current}"
+}
+
 cmdline_add_tokens() {
   local current="$1"
   shift
@@ -1426,7 +1566,7 @@ update_grub_cmdline() {
   local file="/etc/default/grub"
   local current updated
   backup_file "${file}"
-  current="$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "${file}" | head -n1 | cut -d'"' -f2)"
+  current="$(extract_grub_cmdline_default "${file}")"
   updated="$(cmdline_add_tokens "${current}" ${args})"
   if (( DRY_RUN )); then
     printf '[dry-run] update %s GRUB_CMDLINE_LINUX_DEFAULT -> %s\n' "${file}" "${updated}"
@@ -1440,7 +1580,7 @@ remove_grub_token_prefix() {
   local file="/etc/default/grub"
   local current updated
   backup_file "${file}"
-  current="$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "${file}" | head -n1 | cut -d'"' -f2)"
+  current="$(extract_grub_cmdline_default "${file}")"
   updated="$(cmdline_remove_prefix "${current}" "${prefix}")"
   if (( DRY_RUN )); then
     printf '[dry-run] remove tokens with prefix %s from %s\n' "${prefix}" "${file}"
@@ -1663,7 +1803,8 @@ write_state_file() {
   local windows_test_mode="${20}"
   local winhance_payload="${21}"
   local install_profile="${22}"
-  local install_stage="${23}"
+  local windows_password="${23}"
+  local install_stage="${24}"
   local body
 
   body=$(cat <<EOF
@@ -1689,6 +1830,7 @@ USB_DEVICE_IDS="${usb_device_ids}"
 WINDOWS_TEST_MODE="${windows_test_mode}"
 WINHANCE_PAYLOAD="${winhance_payload}"
 INSTALL_PROFILE="${install_profile}"
+WINDOWS_PASSWORD="${windows_password}"
 INSTALL_STAGE="${install_stage}"
 EOF
 )
@@ -1848,14 +1990,17 @@ create_vm_helper_scripts() {
   local usb_device_ids="$9"
   local windows_test_mode="${10}"
   local winhance_payload="${11}"
+  local windows_password="${12}"
   local create_body attach_body video_xml audio_xml unattend_xml setupcomplete_body build_unattend_body build_windows_body set_stage_body
   local controller_xml usb_attach_block id_pair vendor product usb_xml_path
   local user_name_placeholder
   local first_logon_dse_xml="" setupcomplete_dse_body="" first_logon_reboot_xml="" first_logon_debloat_xml=""
   local specialize_run_commands_xml="" unattend_extensions_xml="" winhance_extensions_xml="" winhance_source_xml=""
+  local escaped_windows_password
 
   user_name_placeholder="${SUDO_USER:-${USER:-nick}}"
   winhance_source_xml="${WINHANCE_SOURCE_XML}"
+  escaped_windows_password="$(xml_escape "${windows_password}")"
 
   set_stage_body=$(cat <<'EOF'
 #!/usr/bin/env bash
@@ -2108,7 +2253,7 @@ ${specialize_run_commands_xml}
         <Enabled>true</Enabled>
         <LogonCount>1</LogonCount>
         <Password>
-          <Value>Passw0rd!</Value>
+          <Value>${escaped_windows_password}</Value>
           <PlainText>true</PlainText>
         </Password>
       </AutoLogon>
@@ -2127,7 +2272,7 @@ ${specialize_run_commands_xml}
             <Group>Administrators</Group>
             <DisplayName>${user_name_placeholder}</DisplayName>
             <Password>
-              <Value>Passw0rd!</Value>
+              <Value>${escaped_windows_password}</Value>
               <PlainText>true</PlainText>
             </Password>
           </LocalAccount>
@@ -2188,11 +2333,30 @@ EOF
 )
 
   setupcomplete_body=$'@echo off\r\n'
+  setupcomplete_body+=$'set "PT_SETUP_LOG=%ProgramData%\\Passthrough\\SetupComplete.log"\r\n'
+  setupcomplete_body+=$'set "PT_SETUP_MARKER=%Public%\\Desktop\\Passthrough Post-Install.txt"\r\n'
+  setupcomplete_body+=$'if not exist "%ProgramData%\\Passthrough" mkdir "%ProgramData%\\Passthrough" >nul 2>&1\r\n'
+  setupcomplete_body+=$'echo [%date% %time%] SetupComplete.cmd started>"%PT_SETUP_LOG%"\r\n'
   setupcomplete_body+="${setupcomplete_dse_body}"
   setupcomplete_body+=$'for %%D in (D E F G H I J K L M) do (\r\n'
-  setupcomplete_body+=$'  if exist %%D:\\virtio-win-guest-tools.exe start /wait "" %%D:\\virtio-win-guest-tools.exe /quiet /norestart\r\n'
-  setupcomplete_body+=$'  if exist %%D:\\spice-guest-tools.exe start /wait "" %%D:\\spice-guest-tools.exe /S\r\n'
+  setupcomplete_body+=$'  if exist %%D:\\virtio-win-guest-tools.exe (\r\n'
+  setupcomplete_body+=$'    echo [%date% %time%] Installing virtio guest tools from %%D:>>"%PT_SETUP_LOG%"\r\n'
+  setupcomplete_body+=$'    start /wait "" %%D:\\virtio-win-guest-tools.exe /quiet /norestart\r\n'
+  setupcomplete_body+=$'  )\r\n'
+  setupcomplete_body+=$'  if exist %%D:\\spice-guest-tools.exe (\r\n'
+  setupcomplete_body+=$'    echo [%date% %time%] Installing SPICE guest tools from %%D:>>"%PT_SETUP_LOG%"\r\n'
+  setupcomplete_body+=$'    start /wait "" %%D:\\spice-guest-tools.exe /S\r\n'
+  setupcomplete_body+=$'  )\r\n'
   setupcomplete_body+=$')\r\n'
+  setupcomplete_body+=$'(\r\n'
+  setupcomplete_body+=$'  echo Passthrough post-install tasks finished.\r\n'
+  setupcomplete_body+=$'  echo.\r\n'
+  setupcomplete_body+=$'  echo Time: %date% %time%\r\n'
+  setupcomplete_body+=$'  echo Log: %PT_SETUP_LOG%\r\n'
+  setupcomplete_body+=$'  echo.\r\n'
+  setupcomplete_body+=$'  echo If virtio or SPICE tools were mounted, they were started from SetupComplete.cmd.\r\n'
+  setupcomplete_body+=$') >"%PT_SETUP_MARKER%"\r\n'
+  setupcomplete_body+=$'echo [%date% %time%] SetupComplete.cmd finished>>"%PT_SETUP_LOG%"\r\n'
   setupcomplete_body+=$'exit /b 0\r\n'
 
   create_body=$(cat <<EOF
@@ -2224,11 +2388,19 @@ command -v virt-install >/dev/null 2>&1 || {
   exit 1
 }
 AVAILABLE_GB="\$(df -BG "\$(dirname "\${DISK_PATH}")" 2>/dev/null | awk 'NR==2 {gsub(/G/, "", \$4); print \$4; exit}')"
-REQUIRED_GB="\$((DISK_SIZE_GB + 10))"
+if [[ -f "\${DISK_PATH}" ]]; then
+  REQUIRED_GB="10"
+else
+  REQUIRED_GB="\$((DISK_SIZE_GB + 10))"
+fi
 if [[ -n "\${AVAILABLE_GB}" ]] && (( AVAILABLE_GB < REQUIRED_GB )); then
   echo "Insufficient free space for VM creation." >&2
   echo "Available: \${AVAILABLE_GB}G" >&2
-  echo "Required: \${REQUIRED_GB}G (\${DISK_SIZE_GB}G VM disk + ~10G overhead)" >&2
+  if [[ -f "\${DISK_PATH}" ]]; then
+    echo "Required: \${REQUIRED_GB}G (~10G overhead while reusing existing VM disk \${DISK_PATH})" >&2
+  else
+    echo "Required: \${REQUIRED_GB}G (\${DISK_SIZE_GB}G VM disk + ~10G overhead)" >&2
+  fi
   exit 1
 fi
 
@@ -2442,7 +2614,7 @@ EOF
 </hostdev>
 EOF
 )
-    usb_attach_block+=$'virsh attach-device "${VM_NAME}" /etc/passthrough/${VM_NAME}-usb-controller.xml --config\n'
+    usb_attach_block+=$'virsh -c qemu:///system attach-device "${VM_NAME}" /etc/passthrough/${VM_NAME}-usb-controller.xml --config\n'
   fi
 
   if [[ "${usb_mode}" == "devices" && -n "${usb_device_ids}" ]]; then
@@ -2460,7 +2632,7 @@ EOF
 </hostdev>
 EOF
 )"
-      usb_attach_block+="virsh attach-device \"\${VM_NAME}\" ${usb_xml_path} --config"$'\n'
+      usb_attach_block+="virsh -c qemu:///system attach-device \"\${VM_NAME}\" ${usb_xml_path} --config"$'\n'
     done <<< "${usb_device_ids}"
   fi
 
@@ -2470,18 +2642,154 @@ set -euo pipefail
 
 STATE_FILE="/etc/passthrough/passthrough.conf"
 source "\${STATE_FILE}"
+URI="qemu:///system"
+PATCHED_WINDOWS_ISO="/var/lib/libvirt/images/\${VM_NAME}-windows-install-\${INSTALL_PROFILE:-standard}.iso"
 
-state="\$(virsh domstate "\${VM_NAME}" 2>/dev/null || true)"
+iommu_group_devices() {
+  local pci="\$1"
+  local group_path
+  group_path="\$(readlink -f "/sys/bus/pci/devices/\${pci}/iommu_group" 2>/dev/null || true)"
+  [[ -n "\${group_path}" && -d "\${group_path}/devices" ]] || return 1
+  find -L "\${group_path}/devices" -maxdepth 1 -mindepth 1 -printf '%f\n' | sort
+}
+
+pci_group_isolated() {
+  local pci="\$1"
+  local count
+  count="\$(iommu_group_devices "\${pci}" 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [[ "\${count}" == "1" ]]
+}
+
+state="\$(virsh -c "\${URI}" domstate "\${VM_NAME}" 2>/dev/null || true)"
 if [[ "\${state}" == "running" ]]; then
   echo "Shut down \${VM_NAME} before finalizing GPU passthrough." >&2
   exit 1
 fi
 
-virsh dumpxml "\${VM_NAME}" >/dev/null
-virsh attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-video.xml --config
-virsh attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-audio.xml --config
-${usb_attach_block}/usr/local/bin/passthrough-set-stage gpu-passthrough
+if [[ "\${USB_MODE:-none}" == "controller" && -n "\${USB_CONTROLLER_PCI:-}" ]]; then
+  if ! pci_group_isolated "\${USB_CONTROLLER_PCI}"; then
+    echo "Refusing to passthrough USB controller \${USB_CONTROLLER_PCI}: its IOMMU group is not isolated." >&2
+    echo "Use USB device passthrough instead, or choose a controller in a standalone group." >&2
+    echo "Group contents:" >&2
+    iommu_group_devices "\${USB_CONTROLLER_PCI}" | while read -r dev; do
+      lspci -nns "\${dev}" >&2 || true
+    done
+    exit 1
+  fi
+fi
+
+xml_before="\$(mktemp)"
+xml_after="\$(mktemp)"
+trap 'rm -f "\${xml_before}" "\${xml_after}"' EXIT
+
+virsh -c "\${URI}" dumpxml "\${VM_NAME}" > "\${xml_before}"
+cp "\${xml_before}" "/etc/passthrough/\${VM_NAME}-before-gpu-passthrough.xml"
+cp "\${xml_before}" "\${xml_after}"
+
+python3 - "\${xml_after}" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path = sys.argv[1]
+tree = ET.parse(xml_path)
+root = tree.getroot()
+
+vm_name = root.findtext("name") or "windows"
+vcpus = root.findtext("vcpu") or "4"
+
+def remove_all(parent, tag):
+    for child in list(parent.findall(tag)):
+        parent.remove(child)
+
+devices = root.find("devices")
+if devices is not None:
+    for child in list(devices):
+        if child.tag == "disk" and child.get("device") == "cdrom":
+            devices.remove(child)
+        elif child.tag == "hostdev":
+            devices.remove(child)
+        elif child.tag == "graphics" and child.get("type") == "spice":
+            devices.remove(child)
+        elif child.tag == "video":
+            devices.remove(child)
+        elif child.tag == "channel" and child.get("type") == "spicevmc":
+            devices.remove(child)
+        elif child.tag == "redirdev":
+            devices.remove(child)
+        elif child.tag == "audio" and child.get("type") == "spice":
+            devices.remove(child)
+        elif child.tag == "sound":
+            devices.remove(child)
+        elif child.tag == "input" and child.get("type") == "tablet":
+            devices.remove(child)
+
+features = root.find("features")
+if features is not None:
+    root.remove(features)
+features = ET.Element("features")
+ET.SubElement(features, "acpi")
+ET.SubElement(features, "apic")
+hyperv = ET.SubElement(features, "hyperv", {"mode": "custom"})
+for name, state in (
+    ("relaxed", "on"),
+    ("vapic", "on"),
+    ("spinlocks", "on"),
+    ("vpindex", "on"),
+    ("runtime", "on"),
+    ("synic", "on"),
+    ("stimer", "on"),
+    ("frequencies", "on"),
+    ("tlbflush", "off"),
+    ("ipi", "off"),
+    ("avic", "on"),
+):
+    ET.SubElement(hyperv, name, {"state": state})
+ET.SubElement(features, "vmport", {"state": "off"})
+root.insert(2, features)
+
+cpu = root.find("cpu")
+if cpu is not None:
+    root.remove(cpu)
+cpu = ET.Element("cpu", {"mode": "host-passthrough", "check": "none", "migratable": "on"})
+ET.SubElement(cpu, "topology", {
+    "sockets": "1",
+    "dies": "1",
+    "clusters": "1",
+    "cores": vcpus.strip(),
+    "threads": "1",
+})
+ET.SubElement(cpu, "cache", {"mode": "passthrough"})
+insert_after = root.find("features")
+insert_idx = list(root).index(insert_after) + 1 if insert_after is not None else 3
+root.insert(insert_idx, cpu)
+
+clock = root.find("clock")
+if clock is not None:
+    root.remove(clock)
+clock = ET.Element("clock", {"offset": "localtime"})
+ET.SubElement(clock, "timer", {"name": "hpet", "present": "yes"})
+ET.SubElement(clock, "timer", {"name": "hypervclock", "present": "yes"})
+insert_after = root.find("cpu")
+insert_idx = list(root).index(insert_after) + 1 if insert_after is not None else 4
+root.insert(insert_idx, clock)
+
+tree.write(xml_path, encoding="unicode")
+PY
+
+virsh -c "\${URI}" define "\${xml_after}" >/dev/null
+virsh -c "\${URI}" attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-video.xml --config
+virsh -c "\${URI}" attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-audio.xml --config
+${usb_attach_block}
+
+if [[ "\${EUID}" -eq 0 ]]; then
+  /usr/local/bin/passthrough-set-stage gpu-passthrough || true
+elif command -v sudo >/dev/null 2>&1; then
+  sudo /usr/local/bin/passthrough-set-stage gpu-passthrough || true
+else
+  echo "State file is not writable; skipping stage update to gpu-passthrough" >&2
+fi
 echo "Attached GPU${usb_mode:+ and USB} devices to \${VM_NAME} config."
+echo "Rewrote \${VM_NAME} into passthrough mode (no Spice/QXL, install media removed, Hyper-V/CPU clock blocks applied)."
 echo "Next step: run ./windows from the repo directory to start the finalized passthrough VM."
 EOF
 )
@@ -2529,10 +2837,13 @@ WAIT_SECONDS=15
 SESSION_USER="${session_user}"
 SYSTEM_UNITS_TO_STOP=(
   display-manager.service
+  nvidia-persistenced.service
+  nvidia-powerd.service
 )
 USER_UNITS_TO_STOP=(
   graphical-session.target
   wayland-session.target
+  niri.service
 )
 USER_PROCESSES_TO_KILL=(
   Xorg
@@ -2544,6 +2855,7 @@ USER_PROCESSES_TO_KILL=(
   plasma_session
   niri
   quickshell
+  qs
 )
 GPU_DRIVERS_TO_UNLOAD=(
   nvidia_drm
@@ -2588,50 +2900,40 @@ user_bus_ready() {
   [[ -n "\${uid}" ]] && [[ -S "/run/user/\${uid}/bus" ]]
 }
 
+# Smart discovery of the active display manager
+get_active_display_manager() {
+  local dm
+  dm=$(systemctl list-units --type=service --state=running | grep -E "gdm|sddm|lightdm|lxdm|ly|greetd" | awk '{print $1}' | head -n1)
+  echo "${dm:-display-manager.service}"
+}
+
 stop_system_units() {
-  local unit
-  for unit in "\${SYSTEM_UNITS_TO_STOP[@]}"; do
-    systemctl stop "\${unit}" 2>/dev/null || true
-  done
+  local dm=$(get_active_display_manager)
+  log "Stopping display manager: ${dm}"
+  systemctl stop "${dm}" 2>/dev/null || true
+  systemctl stop nvidia-persistenced.service nvidia-powerd.service 2>/dev/null || true
 }
 
-stop_user_units() {
-  local uid unit
-  uid="\$(user_uid)"
-  [[ -n "\${uid}" ]] || return 0
-
-  if user_bus_ready; then
-    for unit in "\${USER_UNITS_TO_STOP[@]}"; do
-      runuser -u "\${SESSION_USER}" -- env \
-        XDG_RUNTIME_DIR="/run/user/\${uid}" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\${uid}/bus" \
-        systemctl --user stop "\${unit}" 2>/dev/null || true
-    done
+# ... (inside nuke_gpu_users)
+nuke_gpu_users() {
+  local pids
+  local count=0
+  mkdir -p /run/passthrough
+  pids=$(gpu_user_pids)
+  if [[ -n "${pids}" ]]; then
+    ps -p "${pids}" -o comm= > /run/passthrough/killed_names.txt
+    log "Recording GPU users: $(tr '\n' ' ' < /run/passthrough/killed_names.txt)"
   fi
-}
-
-kill_user_processes() {
-  local proc
-  for proc in "\${USER_PROCESSES_TO_KILL[@]}"; do
-    pkill -u "\${SESSION_USER}" -TERM -x "\${proc}" 2>/dev/null || true
-  done
-  sleep 1
-  for proc in "\${USER_PROCESSES_TO_KILL[@]}"; do
-    pkill -u "\${SESSION_USER}" -KILL -x "\${proc}" 2>/dev/null || true
-  done
-}
-
-gpu_user_pids() {
-  lsof -t /dev/dri/* /dev/nvidia* 2>/dev/null | sort -u
-}
-
-wait_for_no_gpu_users() {
-  local deadline=\$((SECONDS + WAIT_SECONDS))
-  while (( SECONDS < deadline )); do
-    if ! gpu_user_pids | grep -q .; then
+  
+  while (( count < 5 )); do
+    pids=$(gpu_user_pids)
+    if [[ -z "${pids}" ]]; then
+      fuser -k -9 /dev/nvidia* /dev/dri/* 2>/dev/null || true
       return 0
     fi
+    echo "${pids}" | xargs -r kill -9 2>/dev/null || true
     sleep 1
+    ((count++))
   done
   return 1
 }
@@ -2650,9 +2952,12 @@ wait_for_module_gone() {
 
 unload_gpu_drivers() {
   local module
-  modprobe -r "\${GPU_DRIVERS_TO_UNLOAD[@]}" || true
+  modprobe -r "\${GPU_DRIVERS_TO_UNLOAD[@]}" 2>/dev/null || true
   for module in "\${GPU_DRIVERS_TO_UNLOAD[@]}"; do
-    wait_for_module_gone "\${module}" || true
+    if lsmod | grep -q "^\${module}"; then
+      modprobe -r "\${module}" 2>/dev/null || true
+      wait_for_module_gone "\${module}" || true
+    fi
   done
 }
 
@@ -2666,17 +2971,7 @@ stop_user_units
 kill_user_processes
 sleep 1
 
-for dev in /dev/dri/card* /dev/nvidia*; do
-  [[ -e "\${dev}" ]] || continue
-  fuser -k -TERM "\${dev}" 2>/dev/null || true
-done
-sleep 1
-
-if gpu_user_pids | grep -q .; then
-  gpu_user_pids | xargs -r kill -KILL 2>/dev/null || true
-fi
-
-wait_for_no_gpu_users || fail "GPU device nodes are still busy"
+nuke_gpu_users || log "Warning: Could not kill all processes using the GPU"
 
 for vt in /sys/class/vtconsole/vtcon*; do
   [[ -w "\${vt}/bind" ]] || continue
@@ -2737,6 +3032,7 @@ virsh nodedev-reattach "\${GPU_VIDEO_NODE}" || true
 modprobe -r vfio_pci vfio_iommu_type1 vfio || true
 
 reload_gpu_drivers
+sleep 1
 
 for vt in /sys/class/vtconsole/vtcon*; do
   [[ -w "\${vt}/bind" ]] || continue
@@ -2747,7 +3043,12 @@ if [[ -e /sys/bus/platform/drivers/efi-framebuffer/bind ]]; then
   echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/bind || true
 fi
 
-systemctl start display-manager.service 2>/dev/null || true
+log "Restarting NVIDIA services..."
+systemctl start nvidia-persistenced.service 2>/dev/null || true
+systemctl start nvidia-powerd.service 2>/dev/null || true
+
+log "Restarting display manager..."
+systemctl restart display-manager.service 2>/dev/null || systemctl start display-manager.service 2>/dev/null || true
 EOF
 )
 
@@ -2815,15 +3116,35 @@ clear_single_gpu_hooks() {
 }
 
 rebuild_bootloader() {
+  local cmd=() output_path tmp_log
   case "$1" in
     grub)
+      tmp_log="$(mktemp)"
       if [[ -d /boot/grub ]]; then
-        run grub-mkconfig -o /boot/grub/grub.cfg
+        cmd=(grub-mkconfig -o /boot/grub/grub.cfg)
+        output_path="/boot/grub/grub.cfg"
       elif [[ -d /boot/grub2 ]]; then
-        run grub2-mkconfig -o /boot/grub2/grub.cfg
+        cmd=(grub2-mkconfig -o /boot/grub2/grub.cfg)
+        output_path="/boot/grub2/grub.cfg"
       else
         warn "GRUB detected but grub.cfg path was not obvious. Rebuild it manually."
+        rm -f "${tmp_log}"
+        return 1
       fi
+      if (( DRY_RUN )); then
+        printf '[dry-run] %s\n' "${cmd[*]}"
+        rm -f "${tmp_log}"
+        return 0
+      fi
+      if "${cmd[@]}" > >(tee "${tmp_log}") 2> >(tee -a "${tmp_log}" >&2); then
+        rm -f "${tmp_log}"
+        return 0
+      fi
+      warn "GRUB rebuild failed. The passthrough config files were written, but ${output_path} was not regenerated."
+      warn "This usually means there is a syntax error in /etc/default/grub or in one of the scripts under /etc/grub.d."
+      warn "Check the failing line reported above and inspect /boot/grub/grub.cfg.new if GRUB created it."
+      rm -f "${tmp_log}"
+      return 1
       ;;
     systemd-boot)
       if command -v kernel-install >/dev/null 2>&1; then
@@ -2849,12 +3170,83 @@ show_iommu_group() {
   done
 }
 
+list_candidate_passthrough_domains() {
+  local requested_vm="$1"
+  printf '%s\n' \
+    "${requested_vm}" \
+    "${requested_vm}-spice" \
+    "windows" \
+    "windows-spice" \
+    "win11" \
+    "win11-spice" | awk 'NF && !seen[$0]++'
+}
+
+existing_passthrough_domains() {
+  local requested_vm="$1"
+  local existing_all
+  existing_all="$(virsh -c qemu:///system list --all --name 2>/dev/null || true)"
+  [[ -n "${existing_all}" ]] || return 0
+  list_candidate_passthrough_domains "${requested_vm}" | while IFS= read -r candidate; do
+    [[ -n "${candidate}" ]] || continue
+    printf '%s\n' "${existing_all}" | grep -Fxq "${candidate}" && printf '%s\n' "${candidate}"
+  done
+}
+
+cleanup_passthrough_domain_assets() {
+  local domain_name="$1"
+  local path
+  for path in \
+    "/var/lib/libvirt/images/${domain_name}.qcow2" \
+    "/var/lib/libvirt/images/${domain_name}-autounattend.iso" \
+    "/var/lib/libvirt/images/${domain_name}-windows-install-standard.iso" \
+    "/var/lib/libvirt/images/${domain_name}-windows-install-winhance.iso" \
+    "/var/lib/libvirt/images/${domain_name}-windows-install.iso"; do
+    [[ -e "${path}" ]] || continue
+    if (( DRY_RUN )); then
+      printf '[dry-run] remove %s\n' "${path}"
+    else
+      printf 'Removing generated VM asset: %s\n' "${path}"
+      rm -f "${path}"
+    fi
+  done
+}
+
+cleanup_existing_passthrough_vms() {
+  local requested_vm="$1"
+  local domains=() domain state
+
+  while IFS= read -r domain; do
+    [[ -n "${domain}" ]] || continue
+    domains+=("${domain}")
+  done < <(existing_passthrough_domains "${requested_vm}")
+
+  (( ${#domains[@]} > 0 )) || return 0
+
+  ui_section "Fresh Install Cleanup"
+  ui_note "Detected old passthrough VM definitions and generated images:" >&2
+  for domain in "${domains[@]}"; do
+    printf '  %b-%b %s\n' "${C_YELLOW}" "${C_RESET}" "${domain}" >&2
+  done
+  if ! confirm "Fresh install cleanup: remove these old passthrough VMs and generated images?" "n"; then
+    return 0
+  fi
+
+  for domain in "${domains[@]}"; do
+    state="$(virsh -c qemu:///system domstate "${domain}" 2>/dev/null || true)"
+    if [[ "${state}" == "running" || "${state}" == "paused" || "${state}" == "in shutdown" ]]; then
+      run virsh -c qemu:///system destroy "${domain}" || true
+    fi
+    run virsh -c qemu:///system undefine "${domain}" --nvram || true
+    cleanup_passthrough_domain_assets "${domain}"
+  done
+}
+
 main() {
   local mode cpu_vendor gpu_entries gpu_choice gpu_pci gpu_desc gpu_audio gpu_audio_pci
   local vfio_ids user_name vm_name bootloader ovmf_code ovmf_vars virtio_iso windows_iso
-  local vcpus memory_mb disk_size_gb windows_version windows_language windows_test_mode
-  local usb_mode usb_controller_entries usb_controller_choice usb_controller_pci usb_device_entries usb_device_ids
-  local winhance_payload install_profile
+  local vcpus memory_mb disk_size_gb windows_version windows_language windows_test_mode windows_password
+  local usb_mode usb_controller_entries usb_controller_choice usb_controller_pci usb_device_entries usb_device_ids isolated_usb_entries
+  local winhance_payload install_profile existing_disk_path bootloader_rebuild_ok="1"
 
   if [[ "${1:-}" == "--help" ]]; then
     usage
@@ -2879,6 +3271,7 @@ main() {
   windows_version="win11x64"
   windows_language="en"
   windows_test_mode="0"
+  windows_password="Passw0rd!"
   winhance_payload="0"
   install_profile="standard"
   usb_mode="none"
@@ -2917,18 +3310,21 @@ main() {
   ui_space
 
   ui_section "VM Configuration"
-  while :; do
-    mode="$(prompt "Choose passthrough mode (single/double)" "single")"
-    case "${mode}" in
-      single|double) break ;;
-      *) warn "Enter either single or double." ;;
-    esac
-  done
+  case "$(prompt_menu_choice "Choose passthrough mode" "1" \
+    "Single-GPU passthrough [single]" \
+    "Dual-GPU passthrough [double]")" in
+    *"[single]") mode="single" ;;
+    *"[double]") mode="double" ;;
+    *) fail "Unexpected passthrough mode selection." ;;
+  esac
 
   user_name="$(prompt "Host username that should be added to libvirt" "${SUDO_USER:-${USER}}")"
   vm_name="$(prompt "Libvirt VM name for hook wiring" "windows")"
+  cleanup_existing_passthrough_vms "${vm_name}"
+  existing_disk_path="/var/lib/libvirt/images/${vm_name}.qcow2"
   windows_version="$(prompt_windows_version "${windows_version}")"
   windows_language="$(prompt_windows_language "${windows_language}")"
+  windows_password="$(prompt_secret "Windows VM password" "${windows_password}")"
   if confirm "Enable Windows test mode and relaxed driver signature enforcement?" "n"; then
     windows_test_mode="1"
   fi
@@ -2939,13 +3335,23 @@ main() {
   vcpus="$(prompt_number "VM vCPU count" "8" "1")"
   memory_mb="$(prompt_number "VM memory in MB" "16384" "1024")"
   disk_size_gb="$(prompt_number "VM disk size in GB" "120" "32")"
-  check_disk_space "/var/lib/libvirt/images" "${disk_size_gb}"
+  if [[ -f "${existing_disk_path}" ]]; then
+    ui_note "Existing VM disk detected and will be reused: ${existing_disk_path}"
+  fi
+  check_disk_space "/var/lib/libvirt/images" "${disk_size_gb}" "${existing_disk_path}"
   usb_controller_entries="$(list_usb_controllers || true)"
+  isolated_usb_entries="$(isolated_usb_controllers "${usb_controller_entries}" || true)"
   if [[ -n "${usb_controller_entries}" ]]; then
-    usb_mode="$(prompt_usb_mode "controller")"
+    if [[ -z "${isolated_usb_entries}" ]]; then
+      warn "No USB controllers are in an isolated IOMMU group. Controller passthrough is unsafe on this host."
+      warn "Falling back to per-device USB passthrough or none."
+      usb_mode="$(prompt_usb_mode "devices")"
+    else
+      usb_mode="$(prompt_usb_mode "controller")"
+    fi
     case "${usb_mode}" in
       controller)
-        usb_controller_choice="$(select_usb_controller "${usb_controller_entries}" "$(recommended_usb_controller "${usb_controller_entries}")")"
+        usb_controller_choice="$(select_usb_controller "${isolated_usb_entries}" "$(recommended_usb_controller "${isolated_usb_entries}")")"
         usb_controller_pci="${usb_controller_choice%%|*}"
         ;;
       devices)
@@ -2974,6 +3380,7 @@ main() {
   ui_kv "VM name" "${vm_name}"
   ui_kv "Windows version" "${windows_version}"
   ui_kv "Windows language" "${windows_language}"
+  ui_kv "Windows password" "[hidden]"
   ui_kv "Windows test mode" "$([[ "${windows_test_mode}" == "1" ]] && printf 'enabled' || printf 'disabled')"
   ui_kv "Install profile" "${install_profile}+virtio"
   ui_kv "vCPUs" "${vcpus}"
@@ -2997,10 +3404,10 @@ main() {
   update_mkinitcpio "${mode}"
   configure_modprobe "${mode}" "${vfio_ids}" "${cpu_vendor}"
   configure_libvirt "${user_name}"
-  write_state_file "${mode}" "${user_name}" "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${vfio_ids}" "${bootloader}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${windows_iso}" "${vcpus}" "${memory_mb}" "${disk_size_gb}" "${windows_version}" "${windows_language}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" "${windows_test_mode}" "${winhance_payload}" "${install_profile}" "host-configured"
+  write_state_file "${mode}" "${user_name}" "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${vfio_ids}" "${bootloader}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${windows_iso}" "${vcpus}" "${memory_mb}" "${disk_size_gb}" "${windows_version}" "${windows_language}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" "${windows_test_mode}" "${winhance_payload}" "${install_profile}" "${windows_password}" "host-configured"
   create_status_script
   create_postboot_service
-  create_vm_helper_scripts "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" "${windows_test_mode}" "${winhance_payload}"
+  create_vm_helper_scripts "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" "${windows_test_mode}" "${winhance_payload}" "${windows_password}"
 
   if [[ "${mode}" == "single" ]]; then
     create_single_gpu_hooks "${vm_name}" "${user_name}" "${gpu_pci}" "${gpu_audio_pci}"
@@ -3008,7 +3415,7 @@ main() {
     clear_single_gpu_hooks "${vm_name}"
   fi
 
-  rebuild_bootloader "${bootloader}"
+  rebuild_bootloader "${bootloader}" || bootloader_rebuild_ok="0"
   if [[ -f /etc/mkinitcpio.conf ]]; then
     run mkinitcpio -P
   fi
@@ -3020,6 +3427,9 @@ main() {
   ui_kv "Status helper" "/usr/local/bin/passthrough-status"
   ui_kv "VM create helper" "/usr/local/bin/passthrough-create-vm"
   ui_kv "GPU attach helper" "/usr/local/bin/passthrough-attach-gpu"
+  if [[ "${bootloader_rebuild_ok}" != "1" ]]; then
+    ui_kv "Bootloader rebuild" "failed; fix GRUB syntax and rerun grub-mkconfig"
+  fi
 
   ui_section "After Reboot"
   printf '  %b1.%b passthrough-status\n' "${C_BLUE}" "${C_RESET}"

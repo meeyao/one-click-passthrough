@@ -1,66 +1,91 @@
 # One-Click Passthrough
 
-Portable host setup and VM lifecycle scripts for Windows GPU passthrough with libvirt.
-
-## Included
-
-- `passthrough-setup.sh`
-- `windows`
-- `windows-create`
-- `windows-install`
-- `windows-finalize`
-- `windows-attach-gpu`
-- `windows-autounattend`
-- `windows-stop`
-- `windows-shutdown`
-- `windows-reset`
-- `windows-reboot`
-- `windows-status`
-- `windows-next`
-- `windows-destroy`
-
-## Intended Flow
-
-1. Run the one-time host installer:
-
-```bash
-sudo ./passthrough-setup.sh
-```
-
-2. Reboot the host, open a fresh shell, then run:
+This repo sets up a Linux host for Windows GPU passthrough, builds an unattended Windows installer, and gives you one main command to drive the VM lifecycle:
 
 ```bash
 ./windows
 ```
 
-That one command handles the current stage:
-- if the VM has not been created yet, it creates and starts the Spice install VM
-- if the install VM is shut down later, it asks whether to resume install or switch to GPU passthrough
-- once finalized, it starts the normal GPU passthrough VM
+It is still a guided setup, not a true zero-input one-click tool.
 
-3. During setup, choose one Windows install profile:
-- `standard+virtio`: unattended Windows install plus virtio/SPICE guest tools
-- `winhance+virtio`: the same virtio path plus the full Winhance unattended payload
+## What You Do
 
-4. Install Windows over Spice and let guest tools finish.
+1. Run the host setup:
 
-5. Shut down the VM and run `./windows` again.
-At any point, run `./windows-next` or `./windows-status` to see the current stage and the next expected step.
+```bash
+sudo ./passthrough-setup.sh
+```
 
-## Notes
+2. Reboot when the script tells you to.
 
-- In `single` GPU mode, switching from Spice install to real passthrough will stop the display manager, tear down the host graphical session, unload GPU drivers, and detach the GPU from Linux.
-- GPU-using apps may be killed during that handoff. Browsers, Electron apps, compositors, and anything holding `/dev/dri/*` or `/dev/nvidia*` are especially likely to die.
-- CPU-only services and containers usually survive. GPU-using containers may be interrupted if they have the card open.
+3. Come back to this folder and run:
+
+```bash
+./windows
+```
+
+4. Install Windows in the Spice window.
+
+5. Shut the VM down and run `./windows` again.
+
+6. Confirm the switch to GPU passthrough when asked.
+
+After that, keep using `./windows` as the normal start command.
+
+During setup, the script also asks for the Windows local account password that will be used by the unattended install.
+If it finds old passthrough VM definitions like `windows`, `windows-spice`, `win11`, or `<your-vm-name>-spice`, it can offer a fresh-install cleanup prompt to remove those stale definitions and generated images.
+
+## What `./windows` Does
+
+- First run: creates and starts the Windows install VM
+- During install phase: reopens or resumes the Spice VM
+- After install is complete: asks whether to switch to GPU passthrough
+- After finalize: starts the passthrough VM normally
+
+If you want a hint, run:
+
+```bash
+./windows-next
+```
+
+If you want more details, run:
+
+```bash
+./windows-status
+```
+
+## Install Profiles
+
+During setup, you choose one of these:
+
+- `standard+virtio`
+  Unattended Windows install plus virtio/SPICE guest tools
+- `winhance+virtio`
+  The same virtio path plus the full Winhance unattended payload
+
+## What to Expect
+
+- A Spice viewer should open automatically during the install phase.
+- If it does not, open the VM with `virt-manager` or `virt-viewer`.
+- In `single` GPU mode, switching to real passthrough will stop the display manager, tear down the host graphical session, unload GPU drivers, and detach the GPU from Linux.
+- Browsers, Electron apps, compositors, and anything actively using `/dev/dri/*` or `/dev/nvidia*` may be killed during that handoff.
+- CPU-only services usually survive. GPU-using containers may not.
 - When the passthrough VM shuts down, the release hook should reattach the GPU to Linux and restart the display manager automatically.
-- This export intentionally excludes machine-specific ROMs, XML dumps, compose files, and personal hardware presets.
-- The installer generates host-specific state under `/etc/passthrough` when you run it.
-- USB passthrough is selected interactively during setup, with a safer review loop for controller or peripheral choices.
-- The `winhance+virtio` profile resolves its source unattended file in this order:
-  1. `WINHANCE_SOURCE_XML` if you override it
-  2. `/home/<user>/Downloads/autounattend.xml` if present
-  3. cached copy at `/etc/passthrough/source-cache/winhance-autounattend.xml`
-  4. upstream fetch from the credited source URL below, then cached locally
+
+## Fresh Installs
+
+The setup script can detect `pacman`, `apt`, `dnf`, or `zypper`, suggest the needed package bundle, and offer to install it.
+
+That means it can help bootstrap a fresh Arch or Ubuntu host, but it is still best treated as a tested beta, not a guaranteed works-on-every-PC release.
+
+## Winhance Source
+
+The `winhance+virtio` profile resolves its source unattended file in this order:
+
+1. `WINHANCE_SOURCE_XML` if you override it
+2. `/home/<user>/Downloads/autounattend.xml` if present
+3. cached copy at `/etc/passthrough/source-cache/winhance-autounattend.xml`
+4. upstream fetch from the credited source below, then cached locally
 
 ## Credits
 

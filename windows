@@ -97,6 +97,11 @@ xml_has_gpu_hostdev() {
   printf '%s' "${xml}" | grep -Fq "domain='0x${GPU_PCI:0:4}' bus='0x${GPU_PCI:5:2}' slot='0x${GPU_PCI:8:2}' function='0x${GPU_PCI:11:1}'"
 }
 
+xml_has_spice_qxl() {
+  local xml="$1"
+  printf '%s' "${xml}" | grep -Eq "<graphics type='spice'|<video>|<channel type='spicevmc'|<redirdev "
+}
+
 infer_stage() {
   local xml install_name
   install_name="${VM_NAME}-spice"
@@ -160,12 +165,20 @@ run_stage_action() {
           exit 0
           ;;
         shut\ off|shut\ off$|"")
-          if confirm "Windows install phase is shut down. Switch to GPU passthrough now?" "n"; then
-            /usr/local/bin/passthrough-attach-gpu
+          if confirm "Windows install VM is shut down. Resume the Spice install VM?" "y"; then
+            virsh -c "${URI}" start "${VM_NAME}"
+            launch_spice_viewer
+            exit 0
+          fi
+          if confirm "Switch this VM to GPU passthrough now?" "n"; then
+            if [[ "${EUID}" -eq 0 ]]; then
+              /usr/local/bin/passthrough-attach-gpu
+            else
+              sudo /usr/local/bin/passthrough-attach-gpu
+            fi
             exec virsh -c "${URI}" start "${VM_NAME}"
           fi
-          virsh -c "${URI}" start "${VM_NAME}"
-          launch_spice_viewer
+          echo "Leaving ${VM_NAME} shut down."
           exit 0
           ;;
         *)
@@ -181,6 +194,15 @@ run_stage_action() {
         echo "Refusing to start passthrough: ${VM_NAME} exists but does not have the configured GPU attached." >&2
         echo "Inspect with: ./windows xml" >&2
         exit 1
+      fi
+      if xml_has_spice_qxl "${xml}"; then
+        echo "Detected stale mixed VM config for ${VM_NAME}; reconciling passthrough settings first."
+        if [[ "${EUID}" -eq 0 ]]; then
+          /usr/local/bin/passthrough-attach-gpu
+        else
+          sudo /usr/local/bin/passthrough-attach-gpu
+        fi
+        xml="$(domain_xml "${VM_NAME}")"
       fi
       if [[ "${state}" == "running" ]]; then
         echo "${VM_NAME} is already running"
@@ -216,11 +238,19 @@ case "${ACTION}" in
     ;;
   attach-gpu)
     shift
-    run_helper /usr/local/bin/passthrough-attach-gpu "$@"
+    if [[ "${EUID}" -eq 0 ]]; then
+      run_helper /usr/local/bin/passthrough-attach-gpu "$@"
+    else
+      exec sudo /usr/local/bin/passthrough-attach-gpu "$@"
+    fi
     ;;
   finalize)
     shift
-    run_helper /usr/local/bin/passthrough-attach-gpu "$@"
+    if [[ "${EUID}" -eq 0 ]]; then
+      run_helper /usr/local/bin/passthrough-attach-gpu "$@"
+    else
+      exec sudo /usr/local/bin/passthrough-attach-gpu "$@"
+    fi
     ;;
   stop|shutdown)
     exec virsh -c "${URI}" shutdown "${VM_NAME}"
