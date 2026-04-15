@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${STATE_FILE:-/etc/passthrough/passthrough.conf}"
+[[ -f "${STATE_FILE}" ]] || { echo "No state file found." >&2; exit 1; }
+source "${STATE_FILE}"
+
+log() { echo "[windows-reset-host] $*"; }
+
+log "Manually restoring host environment..."
+
+# 1. Rebind GPU
+if [[ -n "${GPU_AUDIO_PCI}" ]]; then virsh nodedev-reattach "pci_${GPU_AUDIO_PCI//[:.]/_}" || true; fi
+if [[ -n "${GPU_PCI}" ]]; then virsh nodedev-reattach "pci_${GPU_PCI//[:.]/_}" || true; fi
+
+# 2. Reload drivers
+log "Reloading GPU drivers..."
+modprobe -r vfio_pci vfio_iommu_type1 vfio 2>/dev/null || true
+for mod in xe i915 nvidia nvidia_modeset nvidia_uvm nvidia_drm amdgpu radeon nouveau; do
+  modprobe "${mod}" 2>/dev/null || true
+done
+
+# 3. Restore consoles
+for vt in /sys/class/vtconsole/vtcon*; do
+  [[ -w "${vt}/bind" ]] || echo 1 > "${vt}/bind" || true
+done
+
+# 4. Restart Display Manager
+log "Restarting display manager..."
+systemctl restart display-manager.service 2>/dev/null || systemctl start display-manager.service 2>/dev/null || true
+
+log "Done."

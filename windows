@@ -270,6 +270,14 @@ case "${ACTION}" in
     echo
     exec virsh -c "${URI}" domstate "${VM_NAME}"
     ;;
+  reset-host)
+    shift
+    run_helper /usr/local/bin/passthrough-reset-host "$@"
+    ;;
+  dump-vbios)
+    shift
+    run_helper /usr/local/bin/passthrough-dump-vbios "$@"
+    ;;
   next)
     print_next_step
     exit 0
@@ -278,7 +286,7 @@ case "${ACTION}" in
     exec virsh -c "${URI}" dumpxml "${VM_NAME}"
     ;;
   *)
-    echo "usage: windows [start|create|install|autounattend|attach-gpu|finalize|stop|shutdown|destroy|reset|reboot|status|next|xml]" >&2
+    echo "usage: windows [start|create|install|autounattend|attach-gpu|finalize|dump-vbios|reset-host|stop|shutdown|destroy|reset|reboot|status|next|xml]" >&2
     echo "Run ./windows with no arguments for the stage-aware one-command flow." >&2
     exit 2
     ;;

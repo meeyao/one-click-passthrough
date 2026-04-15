@@ -1410,16 +1410,19 @@ prompt_usb_mode() {
   case "${default}" in
     controller) default_index="2" ;;
     devices|device) default_index="3" ;;
+    evdev) default_index="4" ;;
   esac
 
   answer="$(prompt_menu_choice "USB passthrough mode" "${default_index}" \
     "No USB passthrough [none]" \
     "Pass through one whole USB controller [controller]" \
-    "Pass through selected USB devices [devices]")"
+    "Pass through selected USB devices [devices]" \
+    "Pass through input devices via evdev [evdev]")"
   case "${answer}" in
     *"[none]") printf 'none\n' ;;
     *"[controller]") printf 'controller\n' ;;
     *"[devices]") printf 'devices\n' ;;
+    *"[evdev]") printf 'evdev\n' ;;
     *) fail "Unexpected USB mode selection." ;;
   esac
 }
@@ -1771,9 +1774,35 @@ configure_libvirt() {
     run usermod -aG libvirt "${user_name}"
   fi
 
+  if id -nG "${user_name}" 2>/dev/null | tr ' ' '\n' | grep -qx 'input'; then
+    :
+  else
+    run usermod -aG input "${user_name}"
+  fi
+
   run systemctl enable --now libvirtd.service
   run systemctl enable --now libvirtd.socket
   run virsh net-autostart default
+
+  # Modernize and spoof the default network (borrowed from AutoVirt)
+  local network_xml="/etc/libvirt/qemu/networks/default.xml"
+  if [[ -f "${network_xml}" ]]; then
+    local oui="b0:4e:26"
+    local random_mac="${oui}:$(printf '%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))"
+    backup_file "${network_xml}"
+    if (( DRY_RUN )); then
+      printf '[dry-run] spoof MAC and IP in %s -> %s\n' "${network_xml}" "${random_mac}"
+    else
+      # Change MAC and move from 192.168.122.x to 10.0.0.x
+      sed -i \
+        -e "s|<mac address='[0-9A-Fa-f:]\{17\}'|<mac address='${random_mac}'|g" \
+        -e "s|address='192\.168\.122\.1'|address='10.0.0.1'|g" \
+        -e "s|start='192\.168\.122\.2'|start='10.0.0.2'|g" \
+        -e "s|end='192\.168\.122\.254'|end='10.0.0.254'|g" \
+        "${network_xml}"
+    fi
+  fi
+
   if [[ "$(virsh net-info default 2>/dev/null | awk -F': *' '/^Active:/ {print tolower($2); exit}')" != "yes" ]]; then
     run virsh net-start default
   fi
@@ -2585,11 +2614,20 @@ echo "Built ${OUT_ISO}"
 EOF
 )
 
+  # Automatic VBIOS ROM injection if present
+  local rom_path="/etc/passthrough/roms/vbios_${gpu_pci//[:.]/_}.rom"
+  local rom_xml=""
+  if [[ -f "${rom_path}" ]]; then
+    log "Found custom VBIOS ROM at ${rom_path}. Injecting into VM config."
+    rom_xml="<rom file='${rom_path}'/>"
+  fi
+
   video_xml=$(cat <<EOF
 <hostdev mode='subsystem' type='pci' managed='yes'>
   <source>
     <address domain='0x${gpu_pci:0:4}' bus='0x${gpu_pci:5:2}' slot='0x${gpu_pci:8:2}' function='0x${gpu_pci:11:1}'/>
   </source>
+  ${rom_xml}
 </hostdev>
 EOF
 )
@@ -2617,23 +2655,17 @@ EOF
     usb_attach_block+=$'virsh -c qemu:///system attach-device "${VM_NAME}" /etc/passthrough/${VM_NAME}-usb-controller.xml --config\n'
   fi
 
-  if [[ "${usb_mode}" == "devices" && -n "${usb_device_ids}" ]]; then
-    while IFS= read -r id_pair; do
-      [[ -n "${id_pair}" ]] || continue
-      vendor="${id_pair%%:*}"
-      product="${id_pair##*:}"
-      usb_xml_path="/etc/passthrough/${vm_name}-usb-${vendor}-${product}.xml"
-      write_file "${usb_xml_path}" "$(cat <<EOF
-<hostdev mode='subsystem' type='usb' managed='yes'>
-  <source>
-    <vendor id='0x${vendor}'/>
-    <product id='0x${product}'/>
-  </source>
-</hostdev>
-EOF
-)"
-      usb_attach_block+="virsh -c qemu:///system attach-device \"\${VM_NAME}\" ${usb_xml_path} --config"$'\n'
-    done <<< "${usb_device_ids}"
+  if [[ "${usb_mode}" == "evdev" ]]; then
+    # Generate evdev XML block
+    usb_attach_block+=$'cat <<EOF >> /etc/libvirt/qemu/${VM_NAME}.xml\n'
+    # Logic to auto-detect inputs and inject XML
+    usb_attach_block+=$'shopt -s nullglob\n'
+    usb_attach_block+=$'for dev in /dev/input/by-id/*-event-{kbd,mouse}; do\n'
+    usb_attach_block+=$'  extra_attrs=""\n'
+    usb_attach_block+=$'  [[ "$dev" == *"-event-kbd" ]] && extra_attrs=\' grab="all" repeat="on"\'\n'
+    usb_attach_block+=$'  printf \'    <input type="evdev">\\n      <source dev="%s" grabToggle="shift-shift"%s/>\\n    </input>\\n\' "$dev" "$extra_attrs"\n'
+    usb_attach_block+=$'done\n'
+    usb_attach_block+=$'EOF\n'
   fi
 
   attach_body=$(cat <<EOF
@@ -3418,6 +3450,13 @@ main() {
   rebuild_bootloader "${bootloader}" || bootloader_rebuild_ok="0"
   if [[ -f /etc/mkinitcpio.conf ]]; then
     run mkinitcpio -P
+  fi
+
+  if confirm "Enable auto-recovery watchdog service (recovers host on VM crash)?" "y"; then
+    run cp "${PWD}/passthrough-watchdog.service" /etc/systemd/system/
+    run systemctl daemon-reload
+    run systemctl enable --now passthrough-watchdog
+    ui_kv "Watchdog service" "enabled"
   fi
 
   ui_section "Completed"

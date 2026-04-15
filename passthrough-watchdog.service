@@ -1,0 +1,12 @@
+[Unit]
+Description=Auto-recovery watchdog for Windows GPU Passthrough
+After=libvirtd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/passthrough-watchdog
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
