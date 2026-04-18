@@ -173,6 +173,7 @@ main() {
   local windows_password="Passw0rd!"
   local windows_test_mode="0"
   local winhance_payload="0"
+  local sunshine_payload="0"
   local install_profile="standard"
 
   if [[ -f "${existing_disk_path}" ]]; then
@@ -188,6 +189,9 @@ main() {
     if confirm "Apply Winhance debloat profile (downloads autounattend from memstechtips)?" "n"; then
       winhance_payload="1"
       install_profile="winhance"
+    fi
+    if confirm "Auto-install Sunshine inside the VM for headless Moonlight streaming?" "n"; then
+      sunshine_payload="1"
     fi
   fi
 
@@ -260,6 +264,7 @@ main() {
     ui_kv "Language"       "${windows_language}"
     ui_kv "Password"       "[hidden]"
     ui_kv "Test mode"      "$([[ "${windows_test_mode}" == "1" ]] && printf 'enabled' || printf 'disabled')"
+    ui_kv "Sunshine/VB-Cable" "$([[ "${sunshine_payload}" == "1" ]] && printf 'enabled (installs on first boot)' || printf 'disabled')"
     ui_kv "Install profile" "${install_profile}+virtio"
     ui_kv "Windows ISO"    "${windows_iso:-unset}"
     ui_kv "virtio ISO"     "${virtio_iso:-unset}"
@@ -293,7 +298,7 @@ main() {
     "${windows_version}" "${windows_language}" \
     "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" \
     "${windows_test_mode}" "${winhance_payload}" "${install_profile}" \
-    "${windows_password}" "host-configured"
+    "${windows_password}" "${sunshine_payload}" "host-configured"
 
   create_status_script
   create_postboot_service
@@ -302,7 +307,7 @@ main() {
     "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" \
     "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" \
     "${windows_test_mode}" "${winhance_payload}" "${windows_password}" \
-    "${existing_disk_path}"
+    "${sunshine_payload}" "${existing_disk_path}"
 
   if [[ "${mode}" == "single" ]]; then
     create_single_gpu_hooks "${vm_name}" "${user_name}" "${gpu_pci}" "${gpu_audio_pci}"

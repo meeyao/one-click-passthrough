@@ -15,7 +15,8 @@ create_vm_helper_scripts() {
   local windows_test_mode="${10}"
   local winhance_payload="${11}"
   local windows_password="${12}"
-  local existing_disk="${13:-}"
+  local sunshine_payload="${13:-0}"
+  local existing_disk="${14:-}"
 
   local create_body attach_body video_xml audio_xml unattend_xml setupcomplete_body
   local build_unattend_body build_windows_body set_stage_body controller_xml usb_attach_block
@@ -399,6 +400,25 @@ EOF
   setupcomplete_body+=$'  echo If virtio or SPICE tools were mounted, they were started from SetupComplete.cmd.\r\n'
   setupcomplete_body+=$') >"%PT_SETUP_MARKER%"\r\n'
   setupcomplete_body+=$'echo [%date% %time%] SetupComplete.cmd finished>>"%PT_SETUP_LOG%"\r\n'
+  # Sunshine + VB-Cable silent install (optional, for headless Moonlight streaming)
+  if [[ "${sunshine_payload}" == "1" ]]; then
+    setupcomplete_body+=$'echo [%date% %time%] Installing Sunshine for Moonlight streaming...>>"%%PT_SETUP_LOG%%"\r\n'
+    setupcomplete_body+=$'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$url = (Invoke-RestMethod https://api.github.com/repos/LizardByte/Sunshine/releases/latest).assets | Where-Object { $_.name -like \\\"sunshine-windows-installer.exe\\\" } | Select-Object -ExpandProperty browser_download_url; Invoke-WebRequest -Uri $url -OutFile $env:TEMP\\\\sunshine.exe -UseBasicParsing" 2>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'if exist \"%%TEMP%%\\sunshine.exe\" (\r\n'
+    setupcomplete_body+=$'  start /wait \"\" \"%%TEMP%%\\sunshine.exe\" /S /D=\"%%ProgramFiles%%\\Sunshine\" 2>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'  netsh advfirewall firewall add rule name=\"Sunshine TCP\" protocol=TCP dir=in localport=47984,47989,47990,48010 action=allow >nul 2>&1\r\n'
+    setupcomplete_body+=$'  netsh advfirewall firewall add rule name=\"Sunshine UDP\" protocol=UDP dir=in localport=47998,47999,48000,48002,48010 action=allow >nul 2>&1\r\n'
+    setupcomplete_body+=$'  echo [%date% %time%] Sunshine installed and firewall rules added.>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$')\r\n'
+    # VB-CABLE virtual audio driver (needed for headless audio capture by Sunshine)
+    # Technique borrowed from Parsec-Cloud-Preparation-Tool's AudioInstall function
+    setupcomplete_body+=$'echo [%date% %time%] Installing VB-Cable virtual audio driver...>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"Invoke-WebRequest -Uri https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip -OutFile $env:TEMP\\\\VBCable.zip -UseBasicParsing; Expand-Archive -Path $env:TEMP\\\\VBCable.zip -DestinationPath $env:TEMP\\\\VBCable -Force; $cat = Get-Item $env:TEMP\\\\VBCable\\\\*.cat | Select-Object -First 1; if ($cat) { $cert = (Get-AuthenticodeSignature $cat.FullName).SignerCertificate; [IO.File]::WriteAllBytes(\\\"$env:TEMP\\\\VBCable\\\\vb.cer\\\", $cert.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert)); Import-Certificate -FilePath $env:TEMP\\\\VBCable\\\\vb.cer -CertStoreLocation Cert:\\\\LocalMachine\\\\TrustedPublisher | Out-Null }\" 2>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'if exist \"%%TEMP%%\\VBCable\\VBCABLE_Setup_x64.exe\" (\r\n'
+    setupcomplete_body+=$'  start /wait \"\" \"%%TEMP%%\\VBCable\\VBCABLE_Setup_x64.exe\" -i -h 2>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'  echo [%date% %time%] VB-Cable installed.>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$')\r\n'
+  fi
   setupcomplete_body+=$'exit /b 0\r\n'
 
   # -------------------------------------------------------------------------

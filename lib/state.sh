@@ -26,7 +26,8 @@ write_state_file() {
   local winhance_payload="${21}"
   local install_profile="${22}"
   local windows_password="${23}"
-  local install_stage="${24}"
+  local sunshine_payload="${24:-0}"
+  local install_stage="${25}"
   local body
 
   body=$(cat <<EOF
@@ -51,6 +52,7 @@ USB_CONTROLLER_PCI="${usb_controller_pci}"
 USB_DEVICE_IDS="${usb_device_ids}"
 WINDOWS_TEST_MODE="${windows_test_mode}"
 WINHANCE_PAYLOAD="${winhance_payload}"
+SUNSHINE_PAYLOAD="${sunshine_payload}"
 INSTALL_PROFILE="${install_profile}"
 WINDOWS_PASSWORD="${windows_password}"
 INSTALL_STAGE="${install_stage}"
@@ -310,6 +312,7 @@ uninstall_passthrough() {
     /usr/local/bin/passthrough-set-stage \
     /usr/local/bin/passthrough-build-autounattend \
     /usr/local/bin/passthrough-build-windows-iso \
+    /usr/local/bin/windows-vm \
     /usr/local/libexec/passthrough-postboot-check; do
     [[ -f "${helper}" ]] && rm -f "${helper}"
   done
