@@ -1,46 +1,52 @@
 # One-Click Passthrough
 
-Easily run Windows on Arch Linux with GPU Passthrough.
+A robust, modular, cross-distro Linux script that automates the setup of PCI passthrough / VFIO for Windows VMs.
 
-## Verified Hardware
-This setup has been tested on:
-- **GPU**: NVIDIA GeForce RTX 3070
-- **CPU**: AMD Ryzen 7 3700X
+## Features
 
-*Note: This project is a work-in-progress. Additional testing for systems using Integrated GPUs (iGPUs) is needed.*
+- **Cross-Distro Support**: Works on Arch, Debian/Ubuntu, and Fedora.
+- **Hardware Topology Detection**: Automatically handles single-GPU, dual-GPU (iGPU + dGPU), and multi-dGPU setups.
+- **Libvirt / KVM Setup**: Automates standard VM tuning, CPU topology, and Hyper-V enlightenments.
+- **Bootloader & Initramfs**: Native configuration for GRUB, systemd-boot, and Limine. Rebuilds mkinitcpio, dracut, or update-initramfs transparently.
+- **Anticheat / Concealment**: Automatically sets standard VM concealment flags (CPU virtualization bits, `kvm.hidden`, `ssbd` mitigations) to improve transparency for anti-cheat and anti-virtualization.
+- **Automated Windows ISO Patching**: Directly downloads the latest Windows 11 ISO (via Dockur mirror bypassing Microsoft walls), handles the `virtio` drivers, and injects `unattend.xml` with local user creation, test-signing flags, and Debloat (Winhance) hooks.
 
----
+## Dependencies
 
-## Quick Setup Guide
+The script checks for required dependencies. Basic requirements:
+- KVM / Libvirt / QEMU
+- VFIO utilities
+- bash, curl, jq, 7z/bsdtar, virt-install
 
-1.  **Prepare your system**: Run the setup script to install dependencies and configure your host.
-    ```bash
-    sudo ./passthrough-setup.sh
-    ```
-2.  **Reboot** your machine.
-3.  **Launch the Installer**: Run the management script to start the Windows installation VM.
-    ```bash
-    ./windows
-    ```
-    *A window will appear where you can install Windows as you normally would.*
+## Usage
 
-4.  **Finalize**: Once Windows is installed and you have shut down the VM, run `./windows` again. It will ask if you want to switch to high-performance GPU passthrough mode.
+1. Open a terminal and run the main setup script configuration:
+   ```bash
+   sudo ./passthrough-setup.sh
+   ```
+2. Follow the interactive prompts to select your GPU, configure Libvirt, and optionally download/patch a Windows ISO.
+3. Manage your VM lifecycle easily via the newly installed `windows-vm` command (or `./windows`):
+   ```bash
+   windows-vm start      # Smart start (creates or launches the VM)
+   windows-vm stop       # ACPI shutdown
+   windows-vm attach-gpu # Finalize passthrough
+   windows-vm status     # Check VM stage
+   ```
 
-## How to Manage Your VM
+### Stages of VM Setup
 
-After the initial setup, you only need one command:
+The script uses a staged approach to safely build a Windows VM:
 
-### `./windows`
-This is your "one-click" command. It automatically detects what you are doing:
-- **First run**: Sets up and starts the Windows installer.
-- **Mid-install**: Opens the installer if it's already running.
-- **Post-install**: Asks to switch to GPU Passthrough.
-- **Daily use**: Boots your GPU-accelerated Windows VM.
+1. **Spice Install**: The VM boots with emulated graphics (QXL/Spice). You complete the Windows setup.
+2. **GPU Passthrough**: Running `windows-vm attach-gpu` (or `windows-vm start`) strips the emulated graphics, attaches the physical GPU/USB controllers via XML rewrites, and enables deep KVM concealment.
 
-### Other Useful Commands
-If you need specific tasks, you can still use the underlying tools:
-- `./windows-status`: See what state the VM is in.
-- `./windows-next`: Get a tip on what to do next.
-- `./windows-stop`: Safely shut down the VM.
+## Contributing & Development
 
-*All management scripts are located in the `tools/` folder if you need to access them directly.*
+This project is structured modularly:
+- `passthrough-setup.sh`: Thin orchestrator.
+- `lib/`: Core logic (detect, bootloader, vm config, os parsing).
+- `windows`: The `windows-vm` CLI manager.
+
+## License
+
+This project is licensed under the GPLv3 License. See the [LICENSE](LICENSE) file for more information.

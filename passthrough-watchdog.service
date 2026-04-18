@@ -1,12 +1,14 @@
 [Unit]
-Description=Auto-recovery watchdog for Windows GPU Passthrough
+Description=Passthrough GPU Release Watchdog
+Documentation=https://github.com/meeyao/one-click-passthrough
 After=libvirtd.service
+Wants=libvirtd.service
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/passthrough-watchdog
-Restart=always
-User=root
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/passthrough-status --json
+ExecStop=/bin/true
 
 [Install]
 WantedBy=multi-user.target

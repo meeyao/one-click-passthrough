@@ -1,11 +1,7 @@
-.codex
-*.iso
-*.rom
-*.qcow2
-*.img
-*.log
-*.bak
+.DS_Store
 *.tmp
-*.fd
-*.xml
-!README.md
+*.log
+*.swp
+*.bak
+.idea/
+.vscode/
