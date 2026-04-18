@@ -17,7 +17,10 @@
 #   ./windows next         — print what the next step is
 #   ./windows xml          — dump libvirt XML
 #
-set -euo pipefail
+# Note: intentionally NOT using set -euo pipefail here.
+# This is an interactive script; individual errors are handled explicitly.
+# set -e would abort the script on a failed 'read' (non-TTY) or a virsh command
+# that returns non-zero status, leaving the user with no feedback.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STATE_FILE="${STATE_FILE:-/etc/passthrough/passthrough.conf}"
@@ -41,7 +44,12 @@ confirm() {
   local suffix='[y/N]'
   local answer
   [[ "${default}" == "y" ]] && suffix='[Y/n]'
-  read -r -p "${message} ${suffix}: " answer
+  # If stdin is not a terminal (e.g. called from a service or pipe), use the default.
+  if ! [[ -t 0 ]]; then
+    answer="${default}"
+  else
+    read -r -p "${message} ${suffix}: " answer || answer="${default}"
+  fi
   answer="${answer:-$default}"
   [[ "${answer}" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
@@ -237,10 +245,16 @@ preflight_gpu_release() {
   echo
 
   if [[ "${MODE:-single}" == "single" ]]; then
-    echo "Single-GPU mode — the libvirt hook will evict GPU users, but some may need manual cleanup."
-  else
-    echo "Dedicated-GPU mode — the passthrough GPU is unexpectedly busy."
+    # In single-GPU mode the libvirt prepare hook is the real enforcer.
+    # It will kill all remaining GPU users before doing the driver unload.
+    # We just inform the user — no need to ask or block here.
+    echo "Single-GPU mode: the libvirt prepare hook will evict GPU users automatically."
+    echo "Proceeding to start VM..."
+    return 0
   fi
+
+  # Dedicated-GPU mode — GPU should not be in use. Try to fix it.
+  echo "Dedicated-GPU mode — the passthrough GPU is unexpectedly busy."
 
   # Collect container refs (deduplicated)
   local pid ref
@@ -248,13 +262,17 @@ preflight_gpu_release() {
     ref="$(gpu_container_ref "${pid}" || true)"
     [[ -n "${ref}" ]] && container_refs+=("${ref}")
   done
-  mapfile -t containers < <(printf '%s\n' "${container_refs[@]}" | sort -u)
+  # Guard against empty array expansion
+  if [[ "${#container_refs[@]}" -gt 0 ]]; then
+    mapfile -t containers < <(printf '%s\n' "${container_refs[@]}" | sort -u)
+  fi
 
   if [[ "${#containers[@]}" -gt 0 ]]; then
     echo
     echo "Detected containers using the GPU:"
     local r i
     for r in "${containers[@]}"; do
+      local runtime
       runtime="${r%%:*}"; i="${r#*:}"
       printf '  - %s  %s  id=%s\n' "${runtime}" "$(container_display_name "${runtime}" "${i}")" "${i:0:12}"
     done
@@ -286,7 +304,84 @@ preflight_gpu_release() {
   print_gpu_consumers "${remaining[@]}"
   echo
   echo "Starting ${VM_NAME} may still fail until those processes release the GPU."
-  confirm "Continue and let the libvirt hook make the final attempt?" "n"
+  confirm "Continue anyway?" "n"
+}
+
+# ---------------------------------------------------------------------------
+# Single-GPU pre-launch graceful shutdown
+# ---------------------------------------------------------------------------
+
+# Detect the active display manager and save it to /run/passthrough/ so the
+# release hook and watchdog can restart the right DM even if the prepare
+# hook crashes before it has a chance to save that state itself.
+presave_display_manager() {
+  [[ -n "${GPU_PCI:-}" ]] || return 0
+  local video_node state_dir dm
+  video_node="pci_${GPU_PCI//[:.]/_}"
+  state_dir="/run/passthrough"
+  dm="$(
+    systemctl list-units --type=service --state=running 2>/dev/null \
+      | grep -E 'gdm|sddm|lightdm|lxdm|ly|greetd' \
+      | awk '{print $1}' | head -n1
+  )"
+  dm="${dm:-display-manager.service}"
+  run_maybe_sudo mkdir -p "${state_dir}"
+  printf '%s\n' "${dm}" | run_maybe_sudo tee "${state_dir}/${video_node}.display-manager" >/dev/null
+}
+
+preflight_graceful_shutdown() {
+  # Only meaningful in single-GPU mode — dedicated-GPU doesn't need this.
+  [[ "${MODE:-single}" == "single" ]] || return 0
+
+  echo
+  echo "Single-GPU mode: gracefully stopping GPU consumers before passthrough..."
+  echo "(The VM startup hook will handle the display manager and driver unload.)"
+  echo
+
+  # Pre-save the display manager name NOW while we can still query systemd
+  # from the user session. The hook will also save it, but this is a belt-and-
+  # suspenders backup in case the hook crashes before it reaches save_release_state.
+  presave_display_manager
+
+  # Apps to terminate gracefully — anything that commonly holds the GPU.
+  # Terminal emulators, text editors, shells are intentionally excluded;
+  # they rarely hold DRM/nvidia device nodes and we need our own TTY alive.
+  local -a gpu_apps=(
+    # Browsers
+    firefox firefox-bin chromium chromium-browser google-chrome
+    # Communication / Electron
+    discord Discord slack teams zoom
+    # Creative / streaming
+    obs obs-studio kdenlive blender
+    # Gaming
+    steam gamescope lutris heroic
+    # Media
+    vlc mpv celluloid
+  )
+
+  local app killed=0
+  echo "  Sending SIGTERM to GPU-consuming apps..."
+  for app in "${gpu_apps[@]}"; do
+    if pkill -TERM -x "${app}" 2>/dev/null; then
+      echo "  → TERM  ${app}"
+      killed=1
+    fi
+  done
+
+  if (( killed )); then
+    echo "  Waiting 3s for apps to exit cleanly..."
+    sleep 3
+    echo "  Sending SIGKILL to any remaining stragglers..."
+    for app in "${gpu_apps[@]}"; do
+      pkill -KILL -x "${app}" 2>/dev/null || true
+    done
+    sleep 1
+  else
+    echo "  No GPU-consuming apps found running."
+  fi
+
+  echo "  Pre-flight done. Handing off to VM startup hook."
+  echo
 }
 
 # ---------------------------------------------------------------------------
@@ -383,7 +478,7 @@ stream_mode() {
       ;;
   esac
 
-  preflight_gpu_release || exit 1
+  preflight_graceful_shutdown
   virsh -c "${URI}" start "${VM_NAME}"
   echo "${VM_NAME} started in headless mode."
   print_sunshine_hint
@@ -520,7 +615,7 @@ run_stage_action() {
         echo "${VM_NAME} is already running."
         exit 0
       fi
-      preflight_gpu_release || exit 1
+      preflight_graceful_shutdown
       exec virsh -c "${URI}" start "${VM_NAME}"
       ;;
     *)

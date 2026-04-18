@@ -664,6 +664,14 @@ EOF
     usb_attach_block+=$'if devices is None:\n'
     usb_attach_block+=$'    raise SystemExit("domain XML missing <devices>")\n'
     usb_attach_block+=$'\n'
+    usb_attach_block+=$'# Collect devices already present in XML to avoid duplicates (idempotent)\n'
+    usb_attach_block+=$'existing_evdev = set()\n'
+    usb_attach_block+=$'for el in devices.findall("input"):\n'
+    usb_attach_block+=$'    if el.get("type") == "evdev":\n'
+    usb_attach_block+=$'        src = el.find("source")\n'
+    usb_attach_block+=$'        if src is not None and src.get("dev"):\n'
+    usb_attach_block+=$'            existing_evdev.add(os.path.realpath(src.get("dev")))\n'
+    usb_attach_block+=$'\n'
     usb_attach_block+=$'seen = set()\n'
     usb_attach_block+=$'for base in ("/dev/input/by-id", "/dev/input/by-path"):\n'
     usb_attach_block+=$'    if not os.path.isdir(base):\n'
@@ -676,6 +684,9 @@ EOF
     usb_attach_block+=$'        if real in seen:\n'
     usb_attach_block+=$'            continue\n'
     usb_attach_block+=$'        seen.add(real)\n'
+    usb_attach_block+=$'        # Skip if this device is already in the XML (idempotent re-runs)\n'
+    usb_attach_block+=$'        if real in existing_evdev:\n'
+    usb_attach_block+=$'            continue\n'
     usb_attach_block+=$'        input_el = ET.SubElement(devices, "input", {"type": "evdev"})\n'
     usb_attach_block+=$'        attrs = {"dev": dev, "grabToggle": "shift-shift"}\n'
     usb_attach_block+=$'        if name.endswith("-event-kbd"):\n'
@@ -857,9 +868,12 @@ if devices is not None:
         if child.tag == "memballoon":
             devices.remove(child)
     memballoon = ET.SubElement(devices, "memballoon", {"model": "none"})
-    # Replace PS/2 tablet with USB mouse+keyboard (less detectable)
-    ET.SubElement(devices, "input", {"type": "mouse", "bus": "usb"})
-    ET.SubElement(devices, "input", {"type": "keyboard", "bus": "usb"})
+    # Add USB mouse+keyboard inputs only if not already present (idempotent)
+    existing_usb_inputs = {(c.get("type"), c.get("bus")) for c in devices if c.tag == "input"}
+    if ("mouse", "usb") not in existing_usb_inputs:
+        ET.SubElement(devices, "input", {"type": "mouse", "bus": "usb"})
+    if ("keyboard", "usb") not in existing_usb_inputs:
+        ET.SubElement(devices, "input", {"type": "keyboard", "bus": "usb"})
 
 tree.write(xml_path, encoding="unicode")
 PY
@@ -906,19 +920,23 @@ EOF
   run chmod +x /usr/local/bin/passthrough-set-stage
   run chmod +x /usr/local/bin/passthrough-create-vm
   run chmod +x /usr/local/bin/passthrough-attach-gpu
-  run /usr/local/bin/passthrough-build-autounattend
-  if [[ -f "${existing_disk}" ]]; then
-    # Existing VM disk — skip ISO rebuild only if the patched ISO already exists.
-    # On re-runs after a config change (winhance, sunshine, etc.) the patched ISO
-    # should be rebuilt even though the disk is reused.
-    local patched_iso
-    patched_iso="$(bash -c 'source "${STATE_FILE}"; echo "/var/lib/libvirt/images/${VM_NAME}-windows-install-${INSTALL_PROFILE:-standard}.iso"' STATE_FILE="/etc/passthrough/passthrough.conf" 2>/dev/null || true)"
-    if [[ -n "${patched_iso}" && -f "${patched_iso}" ]]; then
-      ui_note "Skipping Windows ISO generation: existing patched ISO and VM disk found."
+  if [[ "${SKIP_ISO:-0}" == "1" ]]; then
+    ui_note "Skipping ISO generation (--skip-iso)."
+  else
+    run /usr/local/bin/passthrough-build-autounattend
+    if [[ -f "${existing_disk}" ]]; then
+      # Existing VM disk — skip ISO rebuild only if the patched ISO already exists.
+      # On re-runs after a config change (winhance, sunshine, etc.) the patched ISO
+      # should be rebuilt even though the disk is reused.
+      local patched_iso
+      patched_iso="$(bash -c 'source "${STATE_FILE}"; echo "/var/lib/libvirt/images/${VM_NAME}-windows-install-${INSTALL_PROFILE:-standard}.iso"' STATE_FILE="/etc/passthrough/passthrough.conf" 2>/dev/null || true)"
+      if [[ -n "${patched_iso}" && -f "${patched_iso}" ]]; then
+        ui_note "Skipping Windows ISO generation: existing patched ISO and VM disk found."
+      else
+        run /usr/local/bin/passthrough-build-windows-iso
+      fi
     else
       run /usr/local/bin/passthrough-build-windows-iso
     fi
-  else
-    run /usr/local/bin/passthrough-build-windows-iso
   fi
 }

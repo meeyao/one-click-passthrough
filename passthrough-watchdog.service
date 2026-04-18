@@ -5,10 +5,13 @@ After=libvirtd.service
 Wants=libvirtd.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/passthrough-status --json
-ExecStop=/bin/true
+Type=simple
+Restart=on-failure
+RestartSec=5
+ExecStart=/usr/local/bin/passthrough-watchdog
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=passthrough-watchdog
 
 [Install]
 WantedBy=multi-user.target

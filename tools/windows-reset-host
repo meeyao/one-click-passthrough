@@ -1,53 +1,112 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# windows-reset-host — Manually restore the host GPU and display after a
+# passthrough failure. Run as root from a TTY or SSH session.
+#
+# Do NOT use set -e — every step must run even if a previous one failed.
 
 STATE_FILE="${STATE_FILE:-/etc/passthrough/passthrough.conf}"
-[[ -f "${STATE_FILE}" ]] || { echo "No state file found." >&2; exit 1; }
-source "${STATE_FILE}"
+STATE_DIR="/run/passthrough"
 
 log() { echo "[windows-reset-host] $*"; }
 
-selected_gpu_drm_nodes() {
-  local sysfs_base="/sys/bus/pci/devices/${GPU_PCI}"
-  local drm_dir entry devnode
-  drm_dir="${sysfs_base}/drm"
-  [[ -d "${drm_dir}" ]] || return 0
-  for entry in "${drm_dir}"/card* "${drm_dir}"/renderD*; do
-    [[ -e "${entry}" ]] || continue
-    devnode="/dev/$(basename "${entry}")"
-    [[ -e "${devnode}" ]] && printf '%s\n' "${devnode}"
-  done
+[[ -f "${STATE_FILE}" ]] || { log "No state file found: ${STATE_FILE}"; exit 1; }
+# shellcheck disable=SC1090
+source "${STATE_FILE}"
+
+GPU_PCI="${GPU_PCI:-}"
+GPU_AUDIO_PCI="${GPU_AUDIO_PCI:-}"
+
+saved_display_manager() {
+  local video_node sf
+  video_node="pci_${GPU_PCI//[:.]/_}"
+  sf="${STATE_DIR}/${video_node}.display-manager"
+  if [[ -f "${sf}" && -s "${sf}" ]]; then
+    cat "${sf}"
+    return
+  fi
+  systemctl show -p Id display-manager.service 2>/dev/null \
+    | awk -F= '{print $2}' | grep -v '^$' || true
+  echo "display-manager.service"
 }
 
 log "Manually restoring host environment..."
+log "GPU_PCI=${GPU_PCI}  GPU_AUDIO_PCI=${GPU_AUDIO_PCI}"
 
-# 1. Rebind GPU
-if [[ -n "${GPU_AUDIO_PCI}" ]]; then virsh nodedev-reattach "pci_${GPU_AUDIO_PCI//[:.]/_}" || true; fi
-if [[ -n "${GPU_PCI}" ]]; then virsh nodedev-reattach "pci_${GPU_PCI//[:.]/_}" || true; fi
+# 1. Reattach GPU PCI devices from vfio back to host
+log "Reattaching GPU to host..."
+if [[ -n "${GPU_AUDIO_PCI}" ]]; then
+  virsh nodedev-reattach "pci_${GPU_AUDIO_PCI//[:.]/_}" 2>/dev/null || true
+fi
+if [[ -n "${GPU_PCI}" ]]; then
+  virsh nodedev-reattach "pci_${GPU_PCI//[:.]/_}" 2>/dev/null || true
+fi
 
-# 2. Reload drivers
-log "Reloading GPU drivers..."
+# 2. Unload VFIO modules
+log "Removing vfio modules..."
 modprobe -r vfio_pci vfio_iommu_type1 vfio 2>/dev/null || true
-for mod in xe i915 nvidia nvidia_modeset nvidia_uvm nvidia_drm amdgpu radeon nouveau; do
-  modprobe "${mod}" 2>/dev/null || true
-done
 
-# 3. Restore consoles
+# 3. Reload GPU drivers — prefer saved list from prepare hook
+log "Reloading GPU drivers..."
+video_node="pci_${GPU_PCI//[:.]/_}"
+driver_file="${STATE_DIR}/${video_node}.modules"
+if [[ -f "${driver_file}" && -s "${driver_file}" ]]; then
+  log "Using saved module list from ${driver_file}"
+  while IFS= read -r mod; do
+    [[ -n "${mod}" ]] && modprobe "${mod}" 2>/dev/null || true
+  done < "${driver_file}"
+else
+  log "No saved module list — trying all common GPU drivers"
+  for mod in xe i915 nvidia nvidia_modeset nvidia_uvm nvidia_drm amdgpu radeon nouveau; do
+    modprobe "${mod}" 2>/dev/null || true
+  done
+fi
+
+sleep 2
+
+# 4. Re-bind VT consoles
+log "Rebinding VT consoles..."
 for vt in /sys/class/vtconsole/vtcon*; do
   [[ -w "${vt}/bind" ]] || continue
-  echo 1 > "${vt}/bind" || true
+  echo 1 > "${vt}/bind" 2>/dev/null || true
 done
 
+# 5. Re-bind EFI framebuffer
 if [[ -e /sys/bus/platform/drivers/efi-framebuffer/bind ]]; then
-  echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/bind || true
+  echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/bind 2>/dev/null || true
 fi
 
-if mapfile -t drm_nodes < <(selected_gpu_drm_nodes); [[ "${#drm_nodes[@]}" -gt 0 ]]; then
-  log "Selected GPU DRM nodes after recovery: ${drm_nodes[*]}"
+# 6. Restart NVIDIA ancillary services (harmless no-op on AMD/Intel)
+systemctl start nvidia-persistenced.service 2>/dev/null || true
+systemctl start nvidia-powerd.service 2>/dev/null || true
+
+# 7. Show what DRM nodes are available now
+if [[ -n "${GPU_PCI}" ]]; then
+  drm_base="/sys/bus/pci/devices/${GPU_PCI}/drm"
+  if [[ -d "${drm_base}" ]]; then
+    log "DRM nodes now available: $(ls "${drm_base}" 2>/dev/null | tr '\n' ' ')"
+  fi
 fi
 
-# 4. Restart Display Manager
-log "Restarting display manager..."
-systemctl restart display-manager.service 2>/dev/null || systemctl start display-manager.service 2>/dev/null || true
+# 8. Restart display manager using saved name
+dm_unit="$(saved_display_manager)"
+log "Restarting display manager: ${dm_unit}"
+attempt=0
+while (( attempt < 3 )); do
+  systemctl restart "${dm_unit}" 2>/dev/null && break || true
+  sleep 2
+  (( attempt++ ))
+done
 
-log "Done."
+# Verify
+sleep 2
+if systemctl is-active "${dm_unit}" >/dev/null 2>&1; then
+  log "Done — ${dm_unit} is active. Your desktop should be back."
+else
+  log "WARNING: ${dm_unit} did not come up. Trying fallback display managers..."
+  for fallback in sddm gdm lightdm display-manager; do
+    systemctl start "${fallback}.service" 2>/dev/null && {
+      log "Fallback started: ${fallback}.service"
+      break
+    } || true
+  done
+fi

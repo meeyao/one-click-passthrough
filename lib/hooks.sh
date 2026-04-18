@@ -14,41 +14,87 @@ create_single_gpu_hooks() {
 
   prepare=$(cat <<EOF
 #!/usr/bin/env bash
-set -euo pipefail
+# qemu-single-gpu-prepare — runs as root via libvirt QEMU hook on VM start.
+# CRITICAL DESIGN RULES:
+#   1. Never use set -e — every failure must be handled explicitly so the
+#      display can always be restored if we abort mid-sequence.
+#   2. Always call emergency_restore before any hard exit so the user isn't
+#      left with a black screen and no way back.
+#   3. VT consoles are ONLY unbound AFTER the GPU driver has confirmed it
+#      is fully gone — not before.
 
 GPU_VIDEO_NODE="${video_node}"
 GPU_AUDIO_NODE="${audio_node}"
 GPU_PCI="${video_pci}"
 GPU_AUDIO_PCI="${audio_pci}"
-WAIT_SECONDS=15
+WAIT_SECONDS=20
 STATE_DIR="/run/passthrough"
 SESSION_USER="${session_user}"
-SYSTEM_UNITS_TO_STOP=(
-  display-manager.service
-  nvidia-persistenced.service
-  nvidia-powerd.service
-)
-USER_UNITS_TO_STOP=(
-  graphical-session.target
-  wayland-session.target
-  niri.service
-)
-USER_PROCESSES_TO_KILL=(
-  Xorg
-  Xwayland
-  sway
-  Hyprland
-  kwin_wayland
-  gnome-shell
-  plasma_session
-  niri
-  quickshell
-  qs
-  # KDE powerdevil silently holds the GPU I2C bus, blocking nvidia_drm unload
-  # even when lsof /dev/nvidia* shows nothing. Kill it first.
-  # (technique from VFIO-Nvidia-dynamic-unbind/scripts/detachgpu.sh)
-  org_kde_powerdevil
-)
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+log() {
+  logger -t qemu-single-gpu-prepare -- "\$*"
+  echo "[qemu-single-gpu-prepare] \$*" >&2
+}
+
+# Restore the display manager and GPU so the user can still use their system.
+# Called before any hard exit so we never leave a black screen.
+emergency_restore() {
+  log "EMERGENCY RESTORE: attempting to bring display back..."
+  # Re-bind VT consoles (in case we already unbound)
+  for vt in /sys/class/vtconsole/vtcon*; do
+    [[ -w "\${vt}/bind" ]] || continue
+    echo 1 > "\${vt}/bind" 2>/dev/null || true
+  done
+  # Re-bind EFI framebuffer
+  if [[ -e /sys/bus/platform/drivers/efi-framebuffer/bind ]]; then
+    echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/bind 2>/dev/null || true
+  fi
+  # Reattach devices from vfio back to host driver
+  virsh nodedev-reattach "\${GPU_AUDIO_NODE}" >/dev/null 2>&1 || true
+  virsh nodedev-reattach "\${GPU_VIDEO_NODE}" >/dev/null 2>&1 || true
+  modprobe -r vfio_pci vfio_iommu_type1 vfio 2>/dev/null || true
+  # Reload GPU driver
+  reload_gpu_drivers_for_pci "\${GPU_PCI}"
+  # Restart display manager
+  local dm_unit
+  dm_unit="\$(saved_display_manager)"
+  log "Restarting \${dm_unit}..."
+  systemctl restart "\${dm_unit}" 2>/dev/null || systemctl start "\${dm_unit}" 2>/dev/null || true
+  systemctl start nvidia-persistenced.service nvidia-powerd.service 2>/dev/null || true
+  log "Emergency restore complete. Your desktop should return within a few seconds."
+}
+
+saved_display_manager() {
+  local sf="\${STATE_DIR}/\${GPU_VIDEO_NODE}.display-manager"
+  if [[ -f "\${sf}" ]]; then
+    cat "\${sf}"
+  else
+    echo "display-manager.service"
+  fi
+}
+
+reload_gpu_drivers_for_pci() {
+  local pci="\$1" driver
+  driver="\$(lspci -nnk -s "\${pci}" 2>/dev/null | awk -F': ' '/Kernel modules/ {print \$2; exit}' | awk '{print \$1}')"
+  case "\${driver}" in
+    nvidia)
+      for mod in nvidia nvidia_modeset nvidia_uvm nvidia_drm; do
+        modprobe "\${mod}" 2>/dev/null || true
+      done
+      ;;
+    amdgpu|radeon|nouveau|xe|i915)
+      modprobe "\${driver}" 2>/dev/null || true
+      ;;
+    *)
+      # Fallback: try all common ones
+      for mod in nvidia nvidia_modeset nvidia_uvm nvidia_drm amdgpu radeon i915; do
+        modprobe "\${mod}" 2>/dev/null || true
+      done
+      ;;
+  esac
+}
 
 nvidia_device_minor_for_pci() {
   local info_file="/proc/driver/nvidia/gpus/\${GPU_PCI}/information"
@@ -71,19 +117,13 @@ gpu_device_paths() {
   fi
 
   minor="\$(nvidia_device_minor_for_pci)"
-  if [[ "\${minor}" =~ ^[0-9]+$ ]] && [[ -e "/dev/nvidia\${minor}" ]]; then
+  if [[ "\${minor}" =~ ^[0-9]+\$ ]] && [[ -e "/dev/nvidia\${minor}" ]]; then
     printf '%s\n' "/dev/nvidia\${minor}"
   fi
-}
-
-log() {
-  logger -t qemu-single-gpu-prepare -- "\$*"
-  echo "[qemu-single-gpu-prepare] \$*" >&2
-}
-
-fail() {
-  log "ERROR: \$*"
-  exit 1
+  # Also include /dev/nvidiactl, /dev/nvidia-modeset if they exist
+  for extra in /dev/nvidiactl /dev/nvidia-modeset; do
+    [[ -e "\${extra}" ]] && printf '%s\n' "\${extra}"
+  done
 }
 
 state_file_for() {
@@ -103,21 +143,14 @@ user_bus_ready() {
 
 get_active_display_manager() {
   local dm
-  dm=\$(systemctl list-units --type=service --state=running | grep -E "gdm|sddm|lightdm|lxdm|ly|greetd" | awk '{print \$1}' | head -n1)
+  dm=\$(systemctl list-units --type=service --state=running 2>/dev/null \
+    | grep -E 'gdm|sddm|lightdm|lxdm|ly|greetd' \
+    | awk '{print \$1}' | head -n1)
   echo "\${dm:-display-manager.service}"
 }
 
-stop_system_units() {
-  local dm
-  dm="\$(get_active_display_manager)"
-  log "Stopping display manager: \${dm}"
-  systemctl stop "\${dm}" 2>/dev/null || true
-  systemctl stop nvidia-persistenced.service nvidia-powerd.service 2>/dev/null || true
-}
-
 # Signal KWin / DRM compositors to gracefully release the GPU card node before
-# we yank the driver. This avoids a full DE restart on KDE Wayland in many cases.
-# Technique from VFIO-Nvidia-dynamic-unbind/scripts/detachgpu.sh:
+# we yank the driver. Technique from VFIO-Nvidia-dynamic-unbind:
 #   udevadm trigger --action=remove /dev/dri/card1
 # which maps to kwin drm_backend.cpp:L190 hot-remove path.
 udevadm_signal_drm_remove() {
@@ -132,74 +165,131 @@ udevadm_signal_drm_remove() {
   sleep 1
 }
 
+stop_system_units() {
+  local dm
+  dm="\$(get_active_display_manager)"
+  log "Stopping display manager: \${dm}"
+  systemctl stop "\${dm}" 2>/dev/null || true
+  # Give the DM up to 5s to release GPU resources
+  local i=0
+  while (( i < 5 )); do
+    systemctl is-active "\${dm}" >/dev/null 2>&1 || break
+    sleep 1
+    (( i++ ))
+  done
+  systemctl stop nvidia-persistenced.service nvidia-powerd.service 2>/dev/null || true
+}
+
 stop_user_units() {
   local uid unit
   uid="\$(user_uid)"
   [[ -n "\${uid}" ]] || return 0
 
   if user_bus_ready; then
-    for unit in "\${USER_UNITS_TO_STOP[@]}"; do
-      runuser -u "\${SESSION_USER}" -- env \\
-        XDG_RUNTIME_DIR="/run/user/\${uid}" \\
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\${uid}/bus" \\
+    for unit in graphical-session.target wayland-session.target \
+                plasma-plasmashell.service xdg-desktop-portal.service \
+                niri.service; do
+      runuser -u "\${SESSION_USER}" -- env \
+        XDG_RUNTIME_DIR="/run/user/\${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\${uid}/bus" \
         systemctl --user stop "\${unit}" 2>/dev/null || true
     done
   fi
 }
 
 kill_user_processes() {
+  # Kill compositors and GPU-holding user processes
+  local -a procs=(
+    Xorg Xwayland
+    sway Hyprland kwin_wayland kwin_x11 gnome-shell plasmashell
+    plasma_session niri quickshell qs
+    # KDE powerdevil silently holds the GPU I2C bus, blocking nvidia_drm unload
+    org_kde_powerdevil
+    # Common GPU users
+    firefox chromium chrome Discord discord zoom obs
+  )
   local proc
-  for proc in "\${USER_PROCESSES_TO_KILL[@]}"; do
+  for proc in "\${procs[@]}"; do
     pkill -u "\${SESSION_USER}" -TERM -x "\${proc}" 2>/dev/null || true
   done
-  sleep 1
-  for proc in "\${USER_PROCESSES_TO_KILL[@]}"; do
+  sleep 2
+  for proc in "\${procs[@]}"; do
     pkill -u "\${SESSION_USER}" -KILL -x "\${proc}" 2>/dev/null || true
   done
 }
 
-gpu_user_pids() {
+# Kill ALL processes (any user, including system) that hold open GPU device nodes.
+# This is broader than kill_user_processes and is the last resort before module unload.
+nuke_all_gpu_users() {
   local -a devices=()
-  local pid
+  local pid pids_out
   mapfile -t devices < <(gpu_device_paths)
   [[ "\${#devices[@]}" -gt 0 ]] || return 0
-  for pid in \$(fuser "\${devices[@]}" 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u); do
-    [[ "\${pid}" =~ ^[0-9]+$ ]] || continue
-    if ps -o user= -p "\${pid}" 2>/dev/null | awk '{print \$1}' | grep -qx "\${SESSION_USER}"; then
-      printf '%s\n' "\${pid}"
-    fi
-  done
-}
 
-report_gpu_users() {
-  local pid user comm
-  for pid in \$(gpu_user_pids); do
-    user="\$(ps -o user= -p "\${pid}" 2>/dev/null | awk '{print \$1}' || true)"
-    comm="\$(ps -o comm= -p "\${pid}" 2>/dev/null | sed 's/^[[:space:]]*//' || true)"
-    log "GPU user pid=\${pid} user=\${user:-unknown} cmd=\${comm:-unknown}"
-  done
-}
+  local count=0
+  while (( count < 6 )); do
+    pids_out="\$(fuser "\${devices[@]}" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u || true)"
+    [[ -n "\${pids_out}" ]] || return 0   # Nothing left holding GPU
 
-nuke_gpu_users() {
-  local pids pid_csv count=0
-  mkdir -p "\${STATE_DIR}"
-  pids="\$(gpu_user_pids)"
-  if [[ -n "\${pids}" ]]; then
-    pid_csv="\$(printf '%s\n' "\${pids}" | paste -sd, -)"
-    ps -p "\${pid_csv}" -o comm= > "\$(state_file_for killed_names)"
-    log "Recording GPU users: \$(tr '\n' ' ' < "\$(state_file_for killed_names)")"
-  fi
+    # Don't kill ourselves or our parent (qemu/virsh/libvirt)
+    local our_sid
+    our_sid="\$(cat /proc/\$\$/sessionid 2>/dev/null || true)"
+    while IFS= read -r pid; do
+      [[ "\${pid}" =~ ^[0-9]+\$ ]] || continue
+      [[ "\${pid}" == "\$\$" ]] && continue
+      [[ "\${pid}" == "\${PPID}" ]] && continue
+      local comm
+      comm="\$(cat /proc/\${pid}/comm 2>/dev/null || true)"
+      # Never kill libvirt/qemu infrastructure
+      case "\${comm}" in
+        libvirtd|virtqemud|qemu*|virsh) continue ;;
+      esac
+      log "Killing GPU user: pid=\${pid} comm=\${comm:-unknown}"
+      kill -KILL "\${pid}" 2>/dev/null || true
+    done <<< "\${pids_out}"
 
-  while (( count < 5 )); do
-    pids="\$(gpu_user_pids)"
-    if [[ -z "\${pids}" ]]; then
-      return 0
-    fi
-    echo "\${pids}" | xargs -r kill -9 2>/dev/null || true
     sleep 1
-    ((count++))
+    (( count++ ))
   done
-  return 1
+
+  # Final check
+  pids_out="\$(fuser "\${devices[@]}" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u || true)"
+  if [[ -n "\${pids_out}" ]]; then
+    log "WARNING: GPU still has holders after kill attempts: \$(echo "\${pids_out}" | tr '\n' ' ')"
+    # Log what they are
+    while IFS= read -r pid; do
+      [[ "\${pid}" =~ ^[0-9]+\$ ]] || continue
+      local comm user
+      comm="\$(cat /proc/\${pid}/comm 2>/dev/null || true)"
+      user="\$(stat -c '%U' /proc/\${pid} 2>/dev/null || true)"
+      log "  Remaining holder: pid=\${pid} user=\${user:-?} cmd=\${comm:-?}"
+    done <<< "\${pids_out}"
+    # Continue anyway — the module unload will be attempted regardless.
+    # Returning non-zero here used to abort the whole thing and black-screen us.
+    return 0
+  fi
+}
+
+# Release logind session seat so it drops DRM master before we unload
+release_logind_seat() {
+  local uid
+  uid="\$(user_uid)"
+  [[ -n "\${uid}" ]] || return 0
+  # Tell logind to release the session's drm master
+  # loginctl terminate-session works but also logs out; seat-release is gentler.
+  loginctl lock-sessions 2>/dev/null || true
+  sleep 0.5
+  # Ask logind to release control of the session devices
+  if user_bus_ready; then
+    runuser -u "\${SESSION_USER}" -- env \
+      XDG_RUNTIME_DIR="/run/user/\${uid}" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\${uid}/bus" \
+      gdbus call --session \
+        --dest org.freedesktop.login1 \
+        --object-path /org/freedesktop/login1/session/auto \
+        --method org.freedesktop.login1.Session.ReleaseControl \
+      2>/dev/null || true
+  fi
 }
 
 wait_for_module_gone() {
@@ -216,11 +306,12 @@ wait_for_module_gone() {
 
 driver_in_use() {
   local pci="\$1"
-  lspci -nnk -s "\${pci}" | awk -F': ' '/Kernel driver in use/ {print \$2; exit}'
+  lspci -nnk -s "\${pci}" 2>/dev/null | awk -F': ' '/Kernel driver in use/ {print \$2; exit}'
 }
 
 already_detached_to_vfio() {
-  [[ "\$(driver_in_use "\${GPU_PCI}")" == "vfio-pci" ]] && [[ "\$(driver_in_use "\${GPU_AUDIO_PCI}")" == "vfio-pci" ]]
+  [[ "\$(driver_in_use "\${GPU_PCI}")" == "vfio-pci" ]] && \
+  [[ "\$(driver_in_use "\${GPU_AUDIO_PCI}")" == "vfio-pci" ]]
 }
 
 unload_modules_for_driver() {
@@ -259,27 +350,28 @@ unload_gpu_drivers() {
   local -a modules=()
   driver="\$(driver_in_use "\${GPU_PCI}")"
   mapfile -t modules < <(unload_modules_for_driver "\${driver}")
-  [[ "\${#modules[@]}" -gt 0 ]] || return 0
-  log "Unloading selected GPU driver stack for \${GPU_PCI}: \${modules[*]}"
+  [[ "\${#modules[@]}" -gt 0 ]] || { log "No GPU modules to unload for driver '\${driver}'"; return 0; }
+  log "Unloading GPU driver stack for \${GPU_PCI}: \${modules[*]}"
+  # Attempt bulk unload first, then module-by-module with verification
   modprobe -r "\${modules[@]}" 2>/dev/null || true
+  local failed=0
   for module in "\${modules[@]}"; do
     if lsmod | grep -q "^\${module}"; then
       modprobe -r "\${module}" 2>/dev/null || true
-      wait_for_module_gone "\${module}" || fail "\${module} is still loaded after attempted unload"
+      if ! wait_for_module_gone "\${module}"; then
+        log "WARNING: \${module} still loaded after unload attempt — continuing anyway"
+        failed=1
+      fi
     fi
   done
-}
-
-reattach_to_host_and_fail() {
-  virsh nodedev-reattach "\${GPU_AUDIO_NODE}" >/dev/null 2>&1 || true
-  virsh nodedev-reattach "\${GPU_VIDEO_NODE}" >/dev/null 2>&1 || true
-  fail "\$*"
+  return \${failed}
 }
 
 wait_for_vfio_bind() {
   local deadline=\$((SECONDS + WAIT_SECONDS))
   while (( SECONDS < deadline )); do
-    if [[ "\$(driver_in_use "\${GPU_PCI}")" == "vfio-pci" ]] && [[ "\$(driver_in_use "\${GPU_AUDIO_PCI}")" == "vfio-pci" ]]; then
+    if [[ "\$(driver_in_use "\${GPU_PCI}")" == "vfio-pci" ]] && \
+       [[ "\$(driver_in_use "\${GPU_AUDIO_PCI}")" == "vfio-pci" ]]; then
       return 0
     fi
     sleep 1
@@ -287,54 +379,77 @@ wait_for_vfio_bind() {
   return 1
 }
 
+# ── main sequence ──────────────────────────────────────────────────────────
+
 log "Starting single-GPU prepare hook for \${GPU_PCI}"
 
 if already_detached_to_vfio; then
-  log "GPU is already bound to vfio-pci"
+  log "GPU is already bound to vfio-pci — nothing to do"
   exit 0
 fi
 
-# Fire udev remove event first so KWin can gracefully release the DRM node.
-# On KDE Wayland this may avoid the need for a full display manager restart.
+# Step 1: Gracefully signal compositors to drop DRM master
 udevadm_signal_drm_remove
 
+# Step 2: Stop display manager and user session units
 stop_system_units
+release_logind_seat
 stop_user_units
 kill_user_processes
 sleep 1
 
-nuke_gpu_users || {
-  report_gpu_users
-  fail "Selected GPU device nodes are still busy; refusing to unload the GPU driver"
-}
+# Step 3: Kill any remaining GPU holders (all users, any process)
+nuke_all_gpu_users
 
+# Step 4: Save state for the release hook BEFORE we unbind anything
+mkdir -p "\${STATE_DIR}"
+save_release_state
+
+# Step 5: Unload the GPU driver stack.
+# If unload fails we still attempt VFIO bind — some processes releasing
+# their fd after a SIGKILL can un-stick the module.
+unload_gpu_drivers
+UNLOAD_OK=\$?
+
+# Step 6: Unbind VT framebuffers — NOW, only after driver (mostly) gone.
+# If we do this earlier and then fail, we have no way back.
 for vt in /sys/class/vtconsole/vtcon*; do
   [[ -w "\${vt}/bind" ]] || continue
-  echo 0 > "\${vt}/bind" || true
+  echo 0 > "\${vt}/bind" 2>/dev/null || true
 done
 
 if [[ -e /sys/bus/platform/drivers/efi-framebuffer/unbind ]]; then
-  echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind || true
+  echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind 2>/dev/null || true
 fi
 
-save_release_state
-unload_gpu_drivers
+# Step 7: Load VFIO and detach GPU from host
+modprobe vfio 2>/dev/null || true
+modprobe vfio_pci 2>/dev/null || true
+modprobe vfio_iommu_type1 2>/dev/null || true
 
-modprobe vfio
-modprobe vfio_pci
-modprobe vfio_iommu_type1
+virsh nodedev-detach "\${GPU_AUDIO_NODE}" 2>/dev/null || true
+virsh nodedev-detach "\${GPU_VIDEO_NODE}" 2>/dev/null || true
 
-virsh nodedev-detach "\${GPU_AUDIO_NODE}" || true
-virsh nodedev-detach "\${GPU_VIDEO_NODE}" || true
+command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
 
-command -v udevadm >/dev/null 2>&1 && udevadm settle || true
-wait_for_vfio_bind || reattach_to_host_and_fail "GPU functions did not bind to vfio-pci"
+# Step 8: Verify VFIO bind
+if ! wait_for_vfio_bind; then
+  log "ERROR: GPU functions did not bind to vfio-pci within \${WAIT_SECONDS}s"
+  log "Triggering emergency restore to bring desktop back..."
+  emergency_restore
+  exit 1
+fi
+
+log "Single-GPU prepare hook complete — GPU is now bound to vfio-pci"
 EOF
 )
 
   release=$(cat <<EOF
 #!/usr/bin/env bash
-set -euo pipefail
+# qemu-single-gpu-release — runs as root via libvirt QEMU hook on VM stop.
+# This script MUST succeed even if parts of it fail — we always restore
+# the display so the user is not left with a black screen.
+# Do NOT use set -e here.
 
 GPU_VIDEO_NODE="${video_node}"
 GPU_AUDIO_NODE="${audio_node}"
@@ -374,49 +489,74 @@ reload_gpu_drivers() {
   fi
 
   if [[ "\${#modules[@]}" -eq 0 ]]; then
+    # Fallback: try everything
     modules=(nvidia nvidia_modeset nvidia_uvm nvidia_drm amdgpu radeon nouveau xe i915)
   fi
 
   log "Reloading host GPU driver stack: \${modules[*]}"
   for module in "\${modules[@]}"; do
-    modprobe "\${module}" || true
+    modprobe "\${module}" 2>/dev/null || true
   done
 }
 
-virsh nodedev-reattach "\${GPU_AUDIO_NODE}" || true
-virsh nodedev-reattach "\${GPU_VIDEO_NODE}" || true
+log "Starting single-GPU release hook"
 
-modprobe -r vfio_pci vfio_iommu_type1 vfio || true
+# Step 1: Reattach GPU devices from vfio back to host
+virsh nodedev-reattach "\${GPU_AUDIO_NODE}" 2>/dev/null || true
+virsh nodedev-reattach "\${GPU_VIDEO_NODE}" 2>/dev/null || true
 
+# Step 2: Unload VFIO modules
+modprobe -r vfio_pci vfio_iommu_type1 vfio 2>/dev/null || true
+
+# Step 3: Reload host GPU drivers
 reload_gpu_drivers
-sleep 1
 
+# Step 4: Give driver a moment to settle and create device nodes
+sleep 2
+
+# Step 5: Re-bind VT consoles
 for vt in /sys/class/vtconsole/vtcon*; do
   [[ -w "\${vt}/bind" ]] || continue
-  echo 1 > "\${vt}/bind" || true
+  echo 1 > "\${vt}/bind" 2>/dev/null || true
 done
 
+# Step 6: Re-bind EFI framebuffer
 if [[ -e /sys/bus/platform/drivers/efi-framebuffer/bind ]]; then
-  echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/bind || true
+  echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/bind 2>/dev/null || true
 fi
 
-log "Restarting NVIDIA services..."
+# Step 7: Restart NVIDIA services
+log "Restarting optional NVIDIA services..."
 systemctl start nvidia-persistenced.service 2>/dev/null || true
 systemctl start nvidia-powerd.service 2>/dev/null || true
 
+# Step 8: Restart display manager
 log "Restarting display manager..."
-if [[ -f "\$(state_file_for display-manager)" ]]; then
-  dm_unit="\$(cat "\$(state_file_for display-manager)")"
-else
-  dm_unit="display-manager.service"
-fi
-systemctl restart "\${dm_unit}" 2>/dev/null || systemctl start "\${dm_unit}" 2>/dev/null || true
+dm_unit="\$(cat "\$(state_file_for display-manager)" 2>/dev/null || echo "display-manager.service")"
+# Allow up to 3 restart attempts in case the DM exits immediately on first try
+local_attempt=0
+while (( local_attempt < 3 )); do
+  systemctl restart "\${dm_unit}" 2>/dev/null && break || true
+  sleep 1
+  (( local_attempt++ ))
+done
+# Final fallback: try any known DM
+systemctl is-active "\${dm_unit}" >/dev/null 2>&1 || {
+  log "Primary DM \${dm_unit} did not come up — trying fallback display managers..."
+  for fallback in sddm gdm lightdm display-manager; do
+    systemctl start "\${fallback}.service" 2>/dev/null && break || true
+  done
+}
+
+log "Single-GPU release hook complete — display manager restarted"
 EOF
 )
 
   dispatcher=$(cat <<EOF
 #!/usr/bin/env bash
-set -euo pipefail
+# qemu hook dispatcher — routes libvirt QEMU hook calls to the correct scripts.
+# set -euo pipefail is intentionally ABSENT — never kill the dispatcher with a
+# subcommand failure; the sub-scripts handle their own error paths.
 
 VM_NAME="${vm_name}"
 HOOK_DIR="/etc/libvirt/hooks"

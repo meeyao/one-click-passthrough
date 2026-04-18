@@ -214,7 +214,8 @@ The following hardware and software combinations have been tested and are confir
 ## Troubleshooting
 
 **Windows doesn't automatically boot**
-> You may have to go to the QEMU Boot menu and select the DVD ROM option to boot into Windows. In my case I had to press it twice to boot the ISO 
+> You may have to go to the QEMU Boot menu and select the DVD ROM option to boot into Windows. In my case I had to press it twice to boot the ISO.
+
 **Post-boot validation:**
 ```bash
 passthrough-status

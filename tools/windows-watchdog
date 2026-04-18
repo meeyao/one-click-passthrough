@@ -1,50 +1,263 @@
 #!/usr/bin/env bash
-# windows-watchdog: Monitors the VM and triggers host reset if VM crashes
-# while holding the GPU.
+# passthrough-watchdog — GPU passthrough safety net daemon.
+#
+# Runs as a background service. Detects two failure modes and recovers:
+#
+#   1. PREPARE FAILURE: The VM failed to start (prepare hook crashed partway)
+#      while the GPU is still bound to vfio-pci. The host has no display.
+#      → Detected by: GPU in vfio + VM not running, within a short window
+#        after the GPU was first detected in vfio state.
+#
+#   2. RELEASE FAILURE: The VM was running, then stopped/crashed, but the
+#      libvirt release hook didn't fire (libvirtd died, hook crashed, etc.)
+#      → Detected by: GPU in vfio + VM not running, after it was previously
+#        confirmed running.
+#
+# In both cases: call the release sequence to restore the host desktop.
+#
+# Do NOT use set -e — this daemon must never die on a transient error.
 
-set -euo pipefail
+STATE_FILE="${STATE_FILE:-/etc/passthrough/passthrough.conf}"
+POLL_INTERVAL=8          # seconds between checks
+PREPARE_GRACE=45         # seconds to allow for a normal prepare+boot sequence
+STATE_DIR="/run/passthrough"
 
-STATE_FILE="/etc/passthrough/passthrough.conf"
-[[ -f "${STATE_FILE}" ]] || { echo "No state file found." >&2; exit 1; }
-source "${STATE_FILE}"
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [passthrough-watchdog] $*"
+  logger -t passthrough-watchdog -- "$*" 2>/dev/null || true
+}
 
-VM_NAME="${VM_NAME:-windows}"
-GPU_PCI="${GPU_PCI:-}"
+die() {
+  log "FATAL: $*"
+  exit 1
+}
 
-virsh_timeout() {
+# ── Config loading ────────────────────────────────────────────────────────────
+
+load_config() {
+  [[ -f "${STATE_FILE}" ]] || die "State file not found: ${STATE_FILE}"
+  # shellcheck disable=SC1090
+  source "${STATE_FILE}"
+  VM_NAME="${VM_NAME:-windows}"
+  GPU_PCI="${GPU_PCI:-}"
+  GPU_AUDIO_PCI="${GPU_AUDIO_PCI:-}"
+}
+
+# ── State helpers ─────────────────────────────────────────────────────────────
+
+vm_state() {
+  # Returns domstate string or empty on timeout/error
   if command -v timeout >/dev/null 2>&1; then
-    timeout 5s virsh -c qemu:///system "$@" 2>/dev/null
+    timeout 5s virsh -c qemu:///system domstate "${VM_NAME}" 2>/dev/null || true
   else
-    virsh -c qemu:///system "$@" 2>/dev/null
+    virsh -c qemu:///system domstate "${VM_NAME}" 2>/dev/null || true
   fi
 }
 
-is_vm_running() {
-  [[ "$(virsh_timeout domstate "${VM_NAME}" || true)" == "running" ]]
+gpu_driver() {
+  [[ -n "${GPU_PCI}" ]] || return 0
+  lspci -nnk -s "${GPU_PCI}" 2>/dev/null \
+    | awk -F': ' '/Kernel driver in use/ {print $2; exit}'
 }
 
-is_gpu_in_vfio() {
-  [[ -n "${GPU_PCI}" ]] && lspci -nnk -s "${GPU_PCI}" | grep -q "vfio-pci"
+gpu_in_vfio() {
+  [[ "$(gpu_driver)" == "vfio-pci" ]]
 }
 
-gpu_driver_missing() {
-  [[ -n "${GPU_PCI}" ]] && ! lspci -nnk -s "${GPU_PCI}" | grep -q "Kernel driver in use:"
+gpu_has_no_driver() {
+  local driver
+  driver="$(gpu_driver)"
+  [[ -z "${driver}" ]]
 }
 
-echo "Starting windows-watchdog for ${VM_NAME}..."
+gpu_detached() {
+  gpu_in_vfio || gpu_has_no_driver
+}
+
+saved_display_manager() {
+  # Try the per-GPU state file written by the prepare hook first.
+  local video_node sf
+  video_node="pci_${GPU_PCI//[:.]/_}"
+  sf="${STATE_DIR}/${video_node}.display-manager"
+  if [[ -f "${sf}" && -s "${sf}" ]]; then
+    cat "${sf}"
+    return
+  fi
+  # Fallback: ask systemd what's aliased to display-manager.service
+  systemctl show -p Id display-manager.service 2>/dev/null \
+    | awk -F= '{print $2}' | grep -v '^$' || true
+  # Final fallback
+  echo "display-manager.service"
+}
+
+# ── Recovery ──────────────────────────────────────────────────────────────────
+
+do_recovery() {
+  local reason="$1"
+  log "RECOVERY TRIGGERED: ${reason}"
+  log "GPU driver: $(gpu_driver || echo 'none')"
+  log "VM state:   $(vm_state || echo 'unknown')"
+
+  # Step 1: Reattach GPU from vfio back to host PCI driver
+  if [[ -n "${GPU_PCI}" ]]; then
+    local video_node audio_node
+    video_node="pci_${GPU_PCI//[:.]/_}"
+    audio_node="pci_${GPU_AUDIO_PCI//[:.]/_}"
+    log "Reattaching GPU PCI devices to host..."
+    virsh nodedev-reattach "${audio_node}" >/dev/null 2>&1 || true
+    virsh nodedev-reattach "${video_node}" >/dev/null 2>&1 || true
+  fi
+
+  # Step 2: Unload VFIO modules
+  log "Removing vfio modules..."
+  modprobe -r vfio_pci vfio_iommu_type1 vfio 2>/dev/null || true
+
+  # Step 3: Reload host GPU drivers
+  log "Reloading GPU drivers..."
+  local driver_file video_node
+  video_node="pci_${GPU_PCI//[:.]/_}"
+  driver_file="${STATE_DIR}/${video_node}.modules"
+  if [[ -f "${driver_file}" && -s "${driver_file}" ]]; then
+    log "Using saved module list from ${driver_file}"
+    while IFS= read -r mod; do
+      [[ -n "${mod}" ]] && modprobe "${mod}" 2>/dev/null || true
+    done < "${driver_file}"
+  else
+    log "No saved module list — trying all common GPU drivers"
+    for mod in nvidia nvidia_modeset nvidia_uvm nvidia_drm amdgpu radeon nouveau xe i915; do
+      modprobe "${mod}" 2>/dev/null || true
+    done
+  fi
+
+  sleep 2
+
+  # Step 4: Re-bind VT consoles
+  log "Rebinding VT consoles..."
+  for vt in /sys/class/vtconsole/vtcon*; do
+    [[ -w "${vt}/bind" ]] || continue
+    echo 1 > "${vt}/bind" 2>/dev/null || true
+  done
+
+  # Step 5: Re-bind EFI framebuffer
+  if [[ -e /sys/bus/platform/drivers/efi-framebuffer/bind ]]; then
+    echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/bind 2>/dev/null || true
+  fi
+
+  # Step 6: Restart NVIDIA ancillary services
+  systemctl start nvidia-persistenced.service 2>/dev/null || true
+  systemctl start nvidia-powerd.service 2>/dev/null || true
+
+  # Step 7: Restart display manager
+  local dm_unit
+  dm_unit="$(saved_display_manager)"
+  log "Restarting display manager: ${dm_unit}"
+  local attempt=0
+  while (( attempt < 3 )); do
+    systemctl restart "${dm_unit}" 2>/dev/null && break || true
+    sleep 2
+    (( attempt++ ))
+  done
+
+  # Verify it came up
+  sleep 3
+  if systemctl is-active "${dm_unit}" >/dev/null 2>&1; then
+    log "Recovery complete — ${dm_unit} is active. Desktop should be back."
+  else
+    log "WARNING: ${dm_unit} did not come up. Trying fallback DMs..."
+    for fallback in sddm gdm lightdm display-manager; do
+      systemctl start "${fallback}.service" 2>/dev/null && {
+        log "Fallback DM started: ${fallback}.service"
+        break
+      } || true
+    done
+  fi
+}
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+load_config
+
+log "Started. Monitoring VM=${VM_NAME} GPU=${GPU_PCI} (poll every ${POLL_INTERVAL}s)"
+
+# Track state across iterations
+vm_was_running=0          # 1 = we saw the VM running at least once since last boot
+gpu_entered_vfio_at=0     # epoch second when GPU first entered vfio state (0 = not in vfio)
+recovery_done_at=0        # epoch second of last recovery (debounce)
+RECOVERY_DEBOUNCE=60      # don't fire again within this many seconds
 
 while true; do
-  vm_state="$(virsh_timeout domstate "${VM_NAME}" || true)"
-  if [[ -z "${vm_state}" ]]; then
-    if is_gpu_in_vfio || gpu_driver_missing; then
-      echo "[$(date)] virsh domstate timed out or failed while the GPU is detached. Triggering reset-host..."
-      /usr/local/bin/passthrough-reset-host
-    fi
-  elif [[ "${vm_state}" != "running" ]]; then
-    if is_gpu_in_vfio || gpu_driver_missing; then
-      echo "[$(date)] VM ${VM_NAME} state is '${vm_state}' while the GPU is detached. Triggering reset-host..."
-      /usr/local/bin/passthrough-reset-host
-    fi
+  sleep "${POLL_INTERVAL}"
+
+  # Re-read config on each iteration in case setup was re-run
+  if [[ -f "${STATE_FILE}" ]]; then
+    source "${STATE_FILE}" 2>/dev/null || true
+    VM_NAME="${VM_NAME:-windows}"
+    GPU_PCI="${GPU_PCI:-}"
+    GPU_AUDIO_PCI="${GPU_AUDIO_PCI:-}"
   fi
-  sleep 10
+
+  # Only monitor in gpu-passthrough stage
+  if [[ "${INSTALL_STAGE:-}" != "gpu-passthrough" ]]; then
+    gpu_entered_vfio_at=0
+    vm_was_running=0
+    continue
+  fi
+
+  now="${SECONDS}"
+  state="$(vm_state)"
+  state="${state// /}"   # strip whitespace
+
+  # Track if VM ever ran
+  if [[ "${state}" == "running" ]]; then
+    vm_was_running=1
+    gpu_entered_vfio_at=0   # GPU entering vfio while VM is running is expected
+    continue
+  fi
+
+  # GPU state check
+  if gpu_detached; then
+    if (( gpu_entered_vfio_at == 0 )); then
+      gpu_entered_vfio_at="${now}"
+      log "GPU is detached (driver=$(gpu_driver || echo none)) — starting watch timer"
+    fi
+
+    time_in_vfio=$(( now - gpu_entered_vfio_at ))
+    since_last_recovery=$(( now - recovery_done_at ))
+
+    # Debounce: don't re-fire if we just recovered
+    if (( recovery_done_at > 0 && since_last_recovery < RECOVERY_DEBOUNCE )); then
+      continue
+    fi
+
+    if [[ "${state}" == "running" ]]; then
+      # VM is running and GPU is detached — fully normal state, no action
+      gpu_entered_vfio_at=0
+      continue
+    fi
+
+    # VM is NOT running but GPU is detached
+    if (( vm_was_running )); then
+      # Case 2: VM was running and stopped — release hook should have fired but didn't
+      log "RELEASE FAILURE detected: VM was running but stopped (state='${state}') with GPU still detached for ${time_in_vfio}s"
+      do_recovery "VM stopped/crashed without firing release hook"
+      recovery_done_at="${SECONDS}"
+      gpu_entered_vfio_at=0
+      vm_was_running=0
+
+    elif (( time_in_vfio > PREPARE_GRACE )); then
+      # Case 1: GPU has been in vfio for longer than any normal prepare sequence
+      # should take, but VM never reached 'running'. Prepare hook likely crashed.
+      log "PREPARE FAILURE detected: GPU detached for ${time_in_vfio}s but VM never started (state='${state}')"
+      do_recovery "Prepare hook appears to have failed — VM never started"
+      recovery_done_at="${SECONDS}"
+      gpu_entered_vfio_at=0
+      vm_was_running=0
+    fi
+  else
+    # GPU is back on the host driver — all good, reset tracking
+    if (( gpu_entered_vfio_at > 0 )); then
+      log "GPU returned to host driver ($(gpu_driver)) — clearing watch timer"
+    fi
+    gpu_entered_vfio_at=0
+  fi
 done

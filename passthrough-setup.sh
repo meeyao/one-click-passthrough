@@ -46,12 +46,18 @@ unset _lib
 # ---------------------------------------------------------------------------
 usage() {
   cat <<'EOF'
-Usage: passthrough-setup.sh [--dry-run | --uninstall]
+Usage: passthrough-setup.sh [--dry-run | --uninstall | --regen-scripts [--skip-iso]]
 
 Options:
-  --dry-run     Preview all changes without writing anything to disk.
-  --uninstall   Undo host-level changes made by a previous install.
-  --help        Show this help text.
+  --dry-run       Preview all changes without writing anything to disk.
+  --uninstall     Undo host-level changes made by a previous install.
+  --regen-scripts Re-generate helper scripts and hooks from the existing
+                  config (/etc/passthrough/passthrough.conf) without running
+                  the full interactive setup wizard. Use this after pulling
+                  source fixes to apply them without reinstalling everything.
+  --skip-iso      When combined with --regen-scripts, skip rebuilding the
+                  Windows / autounattend ISOs (useful after code-only changes).
+  --help          Show this help text.
 
 What this script does:
   - Detects your CPU, GPU topology, bootloader, and installed firmware.
@@ -69,14 +75,68 @@ EOF
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+regen_scripts() {
+  require_root
+  local conf="/etc/passthrough/passthrough.conf"
+  [[ -f "${conf}" ]] || { echo "No config found at ${conf} — run setup first." >&2; exit 1; }
+  # shellcheck source=/dev/null
+  source "${conf}"
+
+  local existing_disk="/var/lib/libvirt/images/${VM_NAME}.qcow2"
+  local existing_disk_path=""
+  [[ -f "${existing_disk}" ]] && existing_disk_path="${existing_disk}"
+
+  ui_banner
+  ui_section "Regenerating helper scripts from existing config"
+  ui_kv "Config"      "${conf}"
+  ui_kv "VM name"     "${VM_NAME}"
+  ui_kv "GPU"         "${GPU_PCI}"
+  ui_kv "Mode"        "${MODE}"
+  ui_kv "USB mode"    "${USB_MODE:-none}"
+  ui_kv "Skip ISO"    "$([[ "${SKIP_ISO:-0}" == '1' ]] && echo 'yes' || echo 'no')"
+
+  create_vm_helper_scripts \
+    "${VM_NAME}" "${GPU_PCI}" "${GPU_AUDIO_PCI}" \
+    "${OVMF_CODE}" "${OVMF_VARS}" "${VIRTIO_ISO:-}" \
+    "${USB_MODE:-none}" "${USB_CONTROLLER_PCI:-}" "${USB_DEVICE_IDS:-}" \
+    "${WINDOWS_TEST_MODE:-0}" "${WINHANCE_PAYLOAD:-0}" "${WINDOWS_PASSWORD:-Passw0rd!}" \
+    "${SUNSHINE_PAYLOAD:-0}" "${existing_disk_path}"
+
+  if [[ "${MODE}" == "single" ]]; then
+    create_single_gpu_hooks "${VM_NAME}" "${SESSION_USER}" "${GPU_PCI}" "${GPU_AUDIO_PCI}"
+  else
+    clear_single_gpu_hooks "${VM_NAME}"
+  fi
+
+  if [[ -f "${SCRIPT_DIR}/windows" ]]; then
+    run ln -sf "${SCRIPT_DIR}/windows" /usr/local/bin/windows-vm
+    run chmod +x /usr/local/bin/windows-vm
+    ui_kv "Global command" "windows-vm (→ ${SCRIPT_DIR}/windows)"
+  fi
+
+  ui_section "Done"
+  echo "Helper scripts and hooks regenerated from existing config."
+  echo "No reboot required."
+}
+
 main() {
-  case "${1:-}" in
-    --help|-h) usage; exit 0 ;;
-    --dry-run)  DRY_RUN=1 ;;
-    --uninstall) uninstall_passthrough; exit 0 ;;
-    "")         ;;
-    *) usage; exit 2 ;;
-  esac
+  # Parse flags — allow --regen-scripts and --skip-iso in any order
+  local do_regen=0
+  for arg in "$@"; do
+    case "${arg}" in
+      --help|-h)       usage; exit 0 ;;
+      --dry-run)       DRY_RUN=1 ;;
+      --skip-iso)      SKIP_ISO=1 ;;
+      --uninstall)     uninstall_passthrough; exit 0 ;;
+      --regen-scripts) do_regen=1 ;;
+      "")             ;;
+      *) usage; exit 2 ;;
+    esac
+  done
+  if (( do_regen )); then
+    regen_scripts
+    exit 0
+  fi
 
   require_root
   preflight_dependencies
@@ -321,6 +381,10 @@ main() {
 
   if confirm "Enable auto-recovery watchdog service?" "y"; then
     run cp "${SCRIPT_DIR}/passthrough-watchdog.service" /etc/systemd/system/
+    run cp "${SCRIPT_DIR}/tools/windows-watchdog" /usr/local/bin/passthrough-watchdog
+    run chmod +x /usr/local/bin/passthrough-watchdog
+    run cp "${SCRIPT_DIR}/tools/windows-reset-host" /usr/local/bin/passthrough-reset-host
+    run chmod +x /usr/local/bin/passthrough-reset-host
     run systemctl daemon-reload
     run systemctl enable --now passthrough-watchdog
     ui_kv "Watchdog" "enabled"

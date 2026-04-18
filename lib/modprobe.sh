@@ -125,13 +125,22 @@ configure_modprobe() {
     vfio_body+="options vfio-pci ids=${vfio_ids} disable_vga=1"$'\n'
     [[ -n "${softdeps}" ]] && vfio_body+="${softdeps}"$'\n'
     modules_body=$'vfio\nvfio_pci\nvfio_iommu_type1\n'
+    write_file "${vfio_file}" "${vfio_body}"
+    write_file "${modules_file}" "${modules_body}"
   else
+    # Single-GPU mode: vfio modules are loaded/unloaded dynamically by the libvirt hook.
+    # Do NOT add softdeps (they make nvidia/amdgpu depend on vfio-pci at load time,
+    # breaking normal desktop boot) and do NOT pre-load vfio via modules-load.d.
     vfio_body=$'# Managed by passthrough-setup.sh\n'
-    vfio_body+='# Single-GPU mode: GPU bound/unbound via libvirt hooks.'$'\n'
-    [[ -n "${softdeps}" ]] && vfio_body+="${softdeps}"$'\n'
-    modules_body=$'vfio\nvfio_pci\nvfio_iommu_type1\n'
+    vfio_body+='# Single-GPU mode: GPU driver is unbound/rebound at VM start/stop by libvirt hooks.'$'\n'
+    vfio_body+='# No static vfio-pci binding or softdeps needed here.'$'\n'
+    write_file "${vfio_file}" "${vfio_body}"
+    # Remove any stale modules-load.d vfio entry from a previous double-gpu setup
+    if [[ -f "${modules_file}" ]]; then
+      backup_file "${modules_file}"
+      if (( ! DRY_RUN )); then
+        : > "${modules_file}"   # truncate to empty
+      fi
+    fi
   fi
-
-  write_file "${vfio_file}" "${vfio_body}"
-  write_file "${modules_file}" "${modules_body}"
 }
