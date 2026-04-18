@@ -224,7 +224,7 @@ journalctl -u display-manager.service -n 50
 | [AutoVirt](https://github.com/Scrut1ny/AutoVirt) | Anticheat flag patterns, `fmtr::box_text` UI style, softdep pattern |
 | [VFIO-Nvidia-dynamic-unbind](https://github.com/Bensikrac/VFIO-Nvidia-dynamic-unbind) | `udevadm trigger --action=remove` KDE trick, powerdevil kill |
 | [single-gpu-passthrough wiki](https://gitlab.com/risingprismtv/single-gpu-passthrough/-/wikis/home) | `vendor_id` spoof, `smbios mode=host`, `topoext` AMD fix |
-| [Parsec-Cloud-Preparation-Tool](https://github.com/K-Gibson/Parsec-Cloud-Preparation-Tool) | VB-Cable silent install pattern for headless audio |
+| [Parsec-Cloud-Preparation-Tool](https://github.com/parsec-cloud/Parsec-Cloud-Preparation-Tool) | VB-Cable silent install pattern for headless audio |
 | [dockur/windows](https://github.com/dockur/windows) | Windows ISO download mirror bypassing Microsoft's browser gate |
 
 ---
