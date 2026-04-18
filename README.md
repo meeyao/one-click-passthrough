@@ -1,6 +1,5 @@
-# one-click-passthrough
+# AIO-passthrough
 
-> **One command. Reboot. Play.**
 > A robust, modular, cross-distro automated GPU passthrough setup for Linux KVM/QEMU — with anticheat concealment, Sunshine/Moonlight streaming, and a full Windows VM lifecycle manager.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
