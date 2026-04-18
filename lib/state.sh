@@ -101,7 +101,9 @@ echo "Bootloader: ${BOOTLOADER}"
 echo
 EOF
 )
+  body+=$'\n'
   body+="${stage_body}"
+  body+=$'\n'
   body+=$(cat <<'EOF'
 echo "Kernel cmdline:"
 cat /proc/cmdline

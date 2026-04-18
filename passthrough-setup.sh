@@ -35,7 +35,7 @@ SCRIPT_NAME="$(basename "$0")"
 # Source library modules
 # ---------------------------------------------------------------------------
 for _lib in \
-  common detect packages bootloader modprobe libvirt iso windows state hooks vm; do
+  common detect packages bootloader modprobe libvirt iso windows state hooks vm usb; do
   # shellcheck source=/dev/null
   source "${SCRIPT_DIR}/lib/${_lib}.sh"
 done

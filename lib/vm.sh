@@ -421,9 +421,6 @@ EOF
   fi
   setupcomplete_body+=$'exit /b 0\r\n'
 
-  # -------------------------------------------------------------------------
-  # passthrough-create-vm
-  # -------------------------------------------------------------------------
   create_body=$(cat <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -444,29 +441,19 @@ command -v virt-install >/dev/null 2>&1 || { echo "virt-install is required" >&2
 [[ -f "${ovmf_code}" ]] || { echo "Missing OVMF_CODE at ${ovmf_code}" >&2; exit 1; }
 [[ -f "${ovmf_vars}" ]] || { echo "Missing OVMF_VARS at ${ovmf_vars}" >&2; exit 1; }
 
-AVAILABLE_GB="\$(df -BG "\$(dirname "\${DISK_PATH}")" 2>/dev/null | awk 'NR==2 {gsub(/G/, "", \$4); print \$4; exit}')"
-if [[ -f "\${DISK_PATH}" ]]; then
-  REQUIRED_GB="10"
-else
-  REQUIRED_GB="\$((DISK_SIZE_GB + 10))"
-fi
-if [[ -n "\${AVAILABLE_GB}" ]] && (( AVAILABLE_GB < REQUIRED_GB )); then
-  echo "Insufficient free space for VM creation." >&2
-  echo "Available: \${AVAILABLE_GB}G" >&2
-  if [[ -f "\${DISK_PATH}" ]]; then
-    echo "Required: \${REQUIRED_GB}G (~10G overhead while reusing existing VM disk \${DISK_PATH})" >&2
-  else
-    echo "Required: \${REQUIRED_GB}G (\${DISK_SIZE_GB}G VM disk + ~10G overhead)" >&2
-  fi
-  exit 1
-fi
-
 if [[ ! -f "\${PATCHED_WINDOWS_ISO}" ]]; then
   echo "Missing patched Windows ISO: \${PATCHED_WINDOWS_ISO}" >&2
-  echo "Re-run: sudo ./passthrough-setup.sh" >&2
+  echo "Re-run: sudo \$(dirname "\$0")/../passthrough-setup.sh" >&2
   [[ -n "\${WINDOWS_ISO}" ]] && echo "Configured base Windows ISO: \${WINDOWS_ISO}" >&2
   exit 1
 fi
+
+# Always (re)create the disk with qemu-img so:
+#  a) virt-install sees an existing file and never needs the size= argument
+#  b) any partial prior install (EFI System Partition) is wiped, keeping
+#     the HDD blank so OVMF auto-boots from the DVD without confusion.
+echo "Creating blank VM disk (\${DISK_SIZE_GB}G)..."
+qemu-img create -f qcow2 "\${DISK_PATH}" "\${DISK_SIZE_GB}G"
 
 cmd=(
   virt-install
@@ -488,30 +475,27 @@ cmd=(
   --tpm backend.type=emulator,backend.version=2.0,model=tpm-crb
   --osinfo detect=on,require=off
   --noautoconsole
+  --disk "path=\${DISK_PATH},format=qcow2,bus=sata"
 )
 
-if [[ -f "\${DISK_PATH}" ]]; then
-  cmd+=(--disk "path=\${DISK_PATH},format=qcow2,bus=sata")
-else
-  cmd+=(--disk "path=\${DISK_PATH},size=\${DISK_SIZE_GB},format=qcow2,bus=sata")
-fi
-
+# Patched ISO has Autounattend.xml + SetupComplete.cmd embedded inside.
+# OVMF auto-boots from this DVD because the HDD is blank (no EFI partition).
 cmd+=(--disk "path=\${PATCHED_WINDOWS_ISO},device=cdrom")
 
 if [[ -n "\${VIRTIO_MEDIA}" && -f "\${VIRTIO_MEDIA}" ]]; then
   cmd+=(--disk "path=\${VIRTIO_MEDIA},device=cdrom")
 else
-  echo "virtio ISO not found; continuing without attaching one" >&2
+  echo "virtio ISO not found; continuing without one" >&2
 fi
 
 "\${cmd[@]}"
 /usr/local/bin/passthrough-set-stage spice-install
-echo "VM created for Spice install phase."
-echo "A Spice viewer should open automatically."
+echo "VM created. OVMF will auto-boot the patched Windows ISO (blank HDD first)."
 echo "If it does not, open \${VM_NAME} in virt-manager or virt-viewer."
-echo "When Windows setup is finished and the VM is shut down, run ./windows again."
+echo "When Windows setup finishes and the VM shuts down, run ./windows again."
 EOF
 )
+
 
   # -------------------------------------------------------------------------
   # passthrough-build-autounattend
@@ -572,58 +556,53 @@ trap cleanup EXIT
 [[ -f "${SETUPCOMPLETE}" ]] || { echo "Missing ${SETUPCOMPLETE}" >&2; exit 1; }
 command -v xorriso >/dev/null 2>&1 || { echo "Need xorriso to build patched Windows ISO" >&2; exit 1; }
 
-extract_iso() {
-  mkdir -p "${ROOT_DIR}"
-  if command -v 7z >/dev/null 2>&1; then
-    7z x -y "-o${ROOT_DIR}" "${BASE_ISO}" >/dev/null
-    return 0
-  fi
-  if command -v bsdtar >/dev/null 2>&1; then
-    bsdtar -C "${ROOT_DIR}" -xf "${BASE_ISO}"
-    return 0
-  fi
-  echo "Need 7z or bsdtar to extract the Windows ISO" >&2
+# Extract the Windows ISO so we can inject our files and repack.
+# Uses 7z (preferred) or bsdtar.  The resulting ISO is repacked with the
+# original BIOS (etfsboot.com) and EFI (efisys.bin) boot images so OVMF
+# can auto-boot from it without needing manual UEFI menu selection.
+mkdir -p "${ROOT_DIR}"
+if command -v 7z >/dev/null 2>&1; then
+  echo "Extracting ISO with 7z..."
+  7z x -y "-o${ROOT_DIR}" "${BASE_ISO}" > /dev/null
+elif command -v bsdtar >/dev/null 2>&1; then
+  echo "Extracting ISO with bsdtar..."
+  bsdtar -C "${ROOT_DIR}" -xf "${BASE_ISO}"
+else
+  echo "Need 7z (p7zip) or bsdtar to extract the Windows ISO" >&2
   exit 1
-}
+fi
 
-extract_iso
-
-mkdir -p "${ROOT_DIR}/sources/\$OEM\$/\$\$/Setup/Scripts"
+# Inject Autounattend.xml at root and SetupComplete.cmd in sources/$OEM$
 cp "${SRC_DIR}/Autounattend.xml" "${ROOT_DIR}/Autounattend.xml"
+mkdir -p "${ROOT_DIR}/sources/\$OEM\$/\$\$/Setup/Scripts"
 cp "${SETUPCOMPLETE}" "${ROOT_DIR}/sources/\$OEM\$/\$\$/Setup/Scripts/SetupComplete.cmd"
 
 [[ -f "${ROOT_DIR}/boot/etfsboot.com" ]] || {
-  echo "Missing BIOS boot image in extracted Windows ISO: boot/etfsboot.com" >&2
-  exit 1
+  echo "Missing BIOS boot image: boot/etfsboot.com" >&2; exit 1
 }
-
 if [[ -f "${ROOT_DIR}/efi/microsoft/boot/efisys.bin" ]]; then
   EFI_BOOT_IMAGE="efi/microsoft/boot/efisys.bin"
 elif [[ -f "${ROOT_DIR}/efi/microsoft/boot/efisys_noprompt.bin" ]]; then
   EFI_BOOT_IMAGE="efi/microsoft/boot/efisys_noprompt.bin"
 else
-  echo "Missing EFI boot image in extracted Windows ISO" >&2
-  exit 1
+  echo "Missing EFI boot image in extracted Windows ISO" >&2; exit 1
 fi
 
-VOLID="$(xorriso -indev "${BASE_ISO}" -pvd_info 2>/dev/null | awk -F': *' '/^Volume Id/ {print $2; exit}')"
+VOLID="$(xorriso -indev "${BASE_ISO}" -pvd_info 2>/dev/null \
+  | awk -F': *' '/^Volume Id/ {print $2; exit}')"
 VOLID="${VOLID:-WINAUTO}"
 
 rm -f "${OUT_ISO}"
 xorriso -as mkisofs \
   -iso-level 3 \
   -full-iso9660-filenames \
-  -J \
-  -joliet-long \
+  -J -joliet-long \
   -relaxed-filenames \
   -V "${VOLID}" \
   -o "${OUT_ISO}" \
-  -b "boot/etfsboot.com" \
-  -no-emul-boot \
-  -boot-load-size 8 \
+  -b "boot/etfsboot.com" -no-emul-boot -boot-load-size 8 \
   -eltorito-alt-boot \
-  -e "${EFI_BOOT_IMAGE}" \
-  -no-emul-boot \
+  -e "${EFI_BOOT_IMAGE}" -no-emul-boot \
   "${ROOT_DIR}"
 
 echo "Built ${OUT_ISO}"
@@ -929,7 +908,16 @@ EOF
   run chmod +x /usr/local/bin/passthrough-attach-gpu
   run /usr/local/bin/passthrough-build-autounattend
   if [[ -f "${existing_disk}" ]]; then
-    ui_note "Skipping Windows ISO generation: existing VM disk will be reused"
+    # Existing VM disk — skip ISO rebuild only if the patched ISO already exists.
+    # On re-runs after a config change (winhance, sunshine, etc.) the patched ISO
+    # should be rebuilt even though the disk is reused.
+    local patched_iso
+    patched_iso="$(bash -c 'source "${STATE_FILE}"; echo "/var/lib/libvirt/images/${VM_NAME}-windows-install-${INSTALL_PROFILE:-standard}.iso"' STATE_FILE="/etc/passthrough/passthrough.conf" 2>/dev/null || true)"
+    if [[ -n "${patched_iso}" && -f "${patched_iso}" ]]; then
+      ui_note "Skipping Windows ISO generation: existing patched ISO and VM disk found."
+    else
+      run /usr/local/bin/passthrough-build-windows-iso
+    fi
   else
     run /usr/local/bin/passthrough-build-windows-iso
   fi
