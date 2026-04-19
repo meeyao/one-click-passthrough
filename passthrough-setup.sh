@@ -437,4 +437,5 @@ main() {
   fi
 }
 
-main "${1:-}"
+export SKIP_ISO="${SKIP_ISO:-0}"
+main "$@"

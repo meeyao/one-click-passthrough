@@ -20,8 +20,10 @@ create_single_gpu_hooks() {
 #      display can always be restored if we abort mid-sequence.
 #   2. Always call emergency_restore before any hard exit so the user isn't
 #      left with a black screen and no way back.
-#   3. VT consoles are ONLY unbound AFTER the GPU driver has confirmed it
-#      is fully gone — not before.
+#   3. VT consoles MUST be unbound BEFORE modprobe -r nvidia_drm.
+#      nvidia_drm holds vtconsole references, so the module ref-count will
+#      never reach zero and modprobe -r will silently fail if vtconsoles are
+#      still bound when unload is attempted.
 
 GPU_VIDEO_NODE="${video_node}"
 GPU_AUDIO_NODE="${audio_node}"
@@ -405,14 +407,10 @@ nuke_all_gpu_users
 mkdir -p "\${STATE_DIR}"
 save_release_state
 
-# Step 5: Unload the GPU driver stack.
-# If unload fails we still attempt VFIO bind — some processes releasing
-# their fd after a SIGKILL can un-stick the module.
-unload_gpu_drivers
-UNLOAD_OK=\$?
-
-# Step 6: Unbind VT framebuffers — NOW, only after driver (mostly) gone.
-# If we do this earlier and then fail, we have no way back.
+# Step 5: Unbind VT consoles and EFI framebuffer FIRST.
+# nvidia_drm holds references to vtconsoles — the module ref-count will
+# never drop to zero and modprobe -r will silently fail if these are still
+# bound. Unbind them now so the nvidia stack can actually be unloaded.
 for vt in /sys/class/vtconsole/vtcon*; do
   [[ -w "\${vt}/bind" ]] || continue
   echo 0 > "\${vt}/bind" 2>/dev/null || true
@@ -421,6 +419,11 @@ done
 if [[ -e /sys/bus/platform/drivers/efi-framebuffer/unbind ]]; then
   echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind 2>/dev/null || true
 fi
+
+# Step 6: Unload the GPU driver stack (vtconsoles are now unbound so
+# nvidia_drm ref-count can reach zero and the unload will succeed).
+unload_gpu_drivers
+UNLOAD_OK=\$?
 
 # Step 7: Load VFIO and detach GPU from host
 modprobe vfio 2>/dev/null || true
