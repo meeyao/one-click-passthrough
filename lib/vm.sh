@@ -881,11 +881,13 @@ PY
 # Pass CPU_VENDOR into the Python script via environment so topoext logic works
 export CPU_VENDOR="${CPU_VENDOR:-}"
 
-virsh -c "\${URI}" define "\${xml_after}" >/dev/null
-virsh -c "\${URI}" attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-video.xml --config
-virsh -c "\${URI}" attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-audio.xml --config
-${usb_attach_block}
-virsh -c "\${URI}" define "\${xml_after}" >/dev/null
+virsh -c "\\\${URI}" define "\\\${xml_after}" >/dev/null
+virsh -c "\\\${URI}" attach-device "\\\${VM_NAME}" /etc/passthrough/\\\${VM_NAME}-gpu-video.xml --config
+virsh -c "\\\${URI}" attach-device "\\\${VM_NAME}" /etc/passthrough/\\\${VM_NAME}-gpu-audio.xml --config
+virsh -c "\\\${URI}" dumpxml "\\\${VM_NAME}" > "\\\${xml_after}"
+\${usb_attach_block}
+virsh -c "\\\${URI}" define "\\\${xml_after}" >/dev/null
+
 
 if [[ "\${EUID}" -eq 0 ]]; then
   /usr/local/bin/passthrough-set-stage gpu-passthrough || true
